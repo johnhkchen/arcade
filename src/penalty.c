@@ -25,7 +25,7 @@
 #define ARM             0.80f
 #define SHOULDER        0.32f
 #define SHOULDER_Y      0.25f
-#define REACT_DUR       2.8f
+#define REACT_DUR       3.0f
 #define SCRAMBLE_MAX    2
 #define SCRAMBLE_REACH  3.7f
 #define SCRAMBLE_SPEED  9.5f
@@ -48,7 +48,7 @@ typedef struct {
     int     scrambleCount;
     float   scrambleCd;
     // keeper visual pose (sprung)
-    Vector3 kprAxis, kprGL, kprGR, kprGLv, kprGRv, kprHeadOff, reactBase;
+    Vector3 kprAxis, kprGL, kprGR, kprGLv, kprGRv, kprHeadOff, reactBase, reactAxis;
     int     reactAnim;
     bool    reactCelebrate, reactOnGround, landed, reactHeld;
     float   reactT;
@@ -66,6 +66,25 @@ typedef struct {
 static Game    g;
 static NetNode gNet[NET_NY][NET_NX];
 static float   gNetDx, gNetDy;
+
+typedef struct { Color a, b; } Team;   // primary, secondary kit colors
+static const Team TEAMS[] = {
+    {{247,203,44,255},{0,120,60,255}},   {{108,172,228,255},{245,245,245,255}},
+    {{40,60,140,255},{205,30,45,255}},   {{224,60,50,255},{245,245,245,255}},
+    {{255,120,20,255},{25,25,25,255}},   {{25,25,30,255},{230,230,230,255}},
+    {{0,90,160,255},{240,220,40,255}},   {{150,20,50,255},{240,240,240,255}},
+};
+static Team gHome, gAway;
+static const char *MOMENTS[] = {
+    "1994 FINAL  -  Baggio skies the decider",
+    "2006  -  Zidane's cheeky Panenka",
+    "1990  -  Argentina hold their nerve",
+    "2018  -  England finally win a shootout",
+    "1982  -  the first World Cup shootout",
+    "2022 FINAL  -  Argentina prevail on pens",
+    "2006 FINAL  -  Italy, champions on pens",
+    "1994 FINAL  -  Baresi & Massaro denied",
+};
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
@@ -227,7 +246,8 @@ static void ComputeReactionPose(float t, float dt)
     g.kprHeadOff = (Vector3){0};
 
     // dive plays out on the ground before rising (longer for a beaten keeper)
-    float onDur = g.reactCelebrate ? 0.6f : 0.95f, riseDur = 0.6f;
+    float onDur   = g.reactCelebrate ? 0.6f : 1.05f;
+    float riseDur = g.reactCelebrate ? 0.6f : 0.95f;   // heavier, slower rise out of the dive of despair
     float up;
     if (!g.reactOnGround) up = 1.0f;
     else if (t < onDur)            up = 0.0f;
@@ -235,9 +255,11 @@ static void ComputeReactionPose(float t, float dt)
     else                           up = 1.0f;
     up = up*up*(3.0f - 2.0f*up);
 
-    Vector3 diveDir = { (g.reactBase.x >= 0 ? 1.0f : -1.0f), 0.0f, 0.0f };
+    Vector3 lie = (Vector3){ g.reactAxis.x, 0.0f, g.reactAxis.z };     // lie along how it actually landed
+    if (Vector3Length(lie) < 0.1f) lie = (Vector3){ (g.reactBase.x >= 0 ? 1.0f : -1.0f), 0.0f, 0.0f };
+    lie = Vector3Normalize(lie);
     Vector3 center  = { g.reactBase.x, Lerp(groundY - 0.05f, standY, up), g.reactBase.z };
-    Vector3 axis    = Vector3Normalize(Vector3Lerp(diveDir, (Vector3){0,1,0}, up));
+    Vector3 axis    = Vector3Normalize(Vector3Lerp(lie, (Vector3){0,1,0}, up));
     Vector3 gl = { -0.4f, 0.15f, 0.0f }, gr = { 0.4f, 0.15f, 0.0f };
 
     float lt = fmaxf(0.0f, t - (g.reactOnGround ? (onDur + riseDur) : 0.0f));
@@ -300,7 +322,7 @@ static void KeeperReact(float dt)
         float sp = Vector3Length(g.kprVel);
         Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
         UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1));
-        if (g.kprPos.y <= 0.42f) { g.kprPos.y = 0.42f; g.landed = true; g.reactT = 0.0f; g.reactBase = g.kprPos; }
+        if (g.kprPos.y <= 0.42f) { g.kprPos.y = 0.42f; g.landed = true; g.reactT = 0.0f; g.reactBase = g.kprPos; g.reactAxis = g.kprAxis; }
     } else {
         g.reactT += dt;
         ComputeReactionPose(g.reactT, dt);
@@ -322,7 +344,14 @@ static void StartKick(void)
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
     g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
 }
-static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
+static void ResetMatch(void)
+{
+    int n = (int)(sizeof(TEAMS)/sizeof(TEAMS[0]));
+    int hi = GetRandomValue(0, n-1), ai = GetRandomValue(0, n-2);
+    if (ai >= hi) ai++;                                  // distinct matchup
+    gHome = TEAMS[hi]; gAway = TEAMS[ai];
+    g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick();
+}
 
 static Strike AimStrike(void)
 {
@@ -351,7 +380,7 @@ static void Resolve(Result r)
     g.reactHeld = (r == RES_SAVE && g.caught);
     g.reactT = 0.0f; g.kprHeadOff = (Vector3){0};
     if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
-        g.landed = true;  g.reactOnGround = false; g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z };
+        g.landed = true;  g.reactOnGround = false; g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z }; g.reactAxis = (Vector3){0,1,0};
     } else { g.landed = false; g.reactOnGround = true; }
 }
 
@@ -429,10 +458,21 @@ static void StepBallSettle(float dt)
 }
 
 // ---- stadium (bleachers + fans) -----------------------------------------
-static Color CrowdColor(int h)
+// colorblocked stands: left half wears the home kit, right half the away kit
+static Color FanColor(float x, int h)
 {
-    static const Color pal[5] = { {200,70,70,255},{238,238,238,255},{70,110,200,255},{235,200,60,255},{80,180,110,255} };
-    return pal[h % 5];
+    Team tm = (x < 0.0f) ? gHome : gAway;
+    int m = h % 5;
+    if (m == 0) return (Color){235,235,235,255};
+    return (m <= 2) ? tm.a : tm.b;
+}
+static void DrawScoreboard(void)
+{
+    Vector3 c = (Vector3){ 0.0f, 6.2f, GOAL_Z + 8.0f };
+    DrawCube((Vector3){-5.5f, 3.1f, c.z}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});   // supports
+    DrawCube((Vector3){ 5.5f, 3.1f, c.z}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
+    DrawCube(c, 12.0f, 3.4f, 0.4f, (Color){ 15, 17, 25, 255 });                        // screen
+    DrawCubeWires(c, 12.0f, 3.4f, 0.4f, (Color){ 90, 100, 120, 255 });
 }
 static void DrawStadium(void)
 {
@@ -448,7 +488,7 @@ static void DrawStadium(void)
             int h = (r*37 + c*19) % 100;
             float x = -17.0f + c*(34.0f/(COLS-1));
             float jump = cel ? fabsf(sinf(t*12.0f + h))*0.32f : fabsf(sinf(t*1.1f + h))*0.03f;
-            DrawCube((Vector3){x, y + 0.35f + jump, z}, 0.26f, 0.4f, 0.26f, CrowdColor(h));
+            DrawCube((Vector3){x, y + 0.35f + jump, z}, 0.26f, 0.4f, 0.26f, FanColor(x, h));
         }
     }
 }
@@ -553,6 +593,7 @@ static void UpdateDrawFrame(void)
     ClearBackground((Color){ 20, 24, 32, 255 });
     BeginMode3D(g.cam);
         DrawStadium();
+        DrawScoreboard();
         DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
         DrawPitch();
         DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
@@ -563,12 +604,13 @@ static void UpdateDrawFrame(void)
             Vector3 axis = g.kprAxis;
             Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), g.kprHeadOff);
             Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
-            Color body = !g.resolved ? (Color){240,190,40,255}
-                       : (g.reactCelebrate ? (Color){250,205,55,255} : (Color){205,150,40,255});
+            Color body = gHome.a;                                   // home keeper kit
+            if (g.resolved && !g.reactCelebrate)
+                body = (Color){ (unsigned char)(body.r*0.68f), (unsigned char)(body.g*0.68f), (unsigned char)(body.b*0.68f), 255 };
             DrawCapsule(feet, head, 0.26f, 8, 8, body);
             DrawSphere(head, 0.17f, (Color){ 250, 225, 130, 255 });
-            DrawSphere(g.kprGL, GLOVE_R, (Color){ 40, 210, 235, 255 });
-            DrawSphere(g.kprGR, GLOVE_R, (Color){ 40, 210, 235, 255 });
+            DrawSphere(g.kprGL, GLOVE_R, gHome.b);
+            DrawSphere(g.kprGR, GLOVE_R, gHome.b);
         }
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
@@ -583,6 +625,16 @@ static void UpdateDrawFrame(void)
     DrawText("WORLD CUP PENALTY", 20, 16, 28, RAYWHITE);
     DrawText(TextFormat("Kick %d / %d     Scored %d", (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
              20, 50, 20, (Color){ 200, 210, 220, 255 });
+    {   // famous-moment caption projected onto the scoreboard
+        Vector2 sp = GetWorldToScreen((Vector3){ 0.0f, 6.2f, GOAL_Z + 8.0f }, g.cam);
+        int idx = ((int)(GetTime() / 4.0)) % (int)(sizeof(MOMENTS)/sizeof(MOMENTS[0]));
+        if (sp.y > -40.0f && sp.y < H && sp.x > -240.0f && sp.x < W + 240.0f) {
+            const char *hdr = "WORLD CUP PENALTIES";
+            int hw = MeasureText(hdr, 16), cw = MeasureText(MOMENTS[idx], 20);
+            DrawText(hdr, (int)sp.x - hw/2, (int)sp.y - 24, 16, (Color){110,135,175,255});
+            DrawText(MOMENTS[idx], (int)sp.x - cw/2, (int)sp.y, 20, (Color){235,240,245,255});
+        }
+    }
     if (g.phase == PHASE_AIM)
         DrawText("Touch to aim, hold to charge power, drag to curl  (or arrows + SPACE)", 20, H-34, 18, RAYWHITE);
     if (g.phase == PHASE_CHARGE) {
