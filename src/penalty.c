@@ -9,6 +9,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -102,20 +103,27 @@ static const Color gHairTone[FACE_SKINS] = {
 
 typedef struct { Color a, b; } Team;   // primary, secondary kit colors
 static const Team TEAMS[] = {
-    {{247,203,44,255},{0,120,60,255}},   {{108,172,228,255},{245,245,245,255}},
-    {{40,60,140,255},{205,30,45,255}},   {{224,60,50,255},{245,245,245,255}},
-    {{255,120,20,255},{25,25,25,255}},   {{25,25,30,255},{230,230,230,255}},
-    {{0,90,160,255},{240,220,40,255}},   {{150,20,50,255},{240,240,240,255}},
+    {{247,203,44,255},{0,120,60,255}},   {{108,172,228,255},{245,245,245,255}},   // 0 canary/green   1 sky/white
+    {{40,60,140,255},{205,30,45,255}},   {{224,60,50,255},{245,245,245,255}},     // 2 blue/red       3 red/white
+    {{255,120,20,255},{25,25,25,255}},   {{25,25,30,255},{230,230,230,255}},      // 4 orange/black   5 black/white
+    {{0,90,160,255},{240,220,40,255}},   {{150,20,50,255},{240,240,240,255}},     // 6 blue/gold      7 maroon/white
+    {{245,245,245,255},{28,48,120,255}}, {{20,85,165,255},{245,245,245,255}},     // 8 white/navy     9 azzurri
+    {{170,30,45,255},{245,215,70,255}},  {{210,40,55,255},{40,60,150,255}},       // 10 red/gold      11 red/navy
+    {{200,40,45,255},{250,205,50,255}},  {{90,175,215,255},{25,40,90,255}},       // 12 red/yellow    13 sky/navy
 };
 static Team gHome, gAway;
 static BoardEra gEra;
 #define ROUNDS 3
 // A historical shootout: its era look, year, how many the OPPONENT scored, and the two kits.
 typedef struct { BoardEra era; const char *year; int oppGoals; int home, away; } Moment;
+// A deep pool; each session draws ROUNDS of these at random, so the run of
+// eras / matchups / targets differs every time you sit down.
 static const Moment POOL[] = {
-    { ERA_00S,    "2006", 4, 4, 0 },
-    { ERA_70S,    "1978", 2, 1, 6 },
-    { ERA_90S,    "1994", 3, 3, 5 },
+    { ERA_70S,    "1970", 3, 0,  9 },   { ERA_70S,    "1974", 2, 5,  4 },
+    { ERA_70S,    "1978", 3, 1,  3 },   { ERA_90S,    "1990", 2, 5,  1 },
+    { ERA_90S,    "1994", 4, 0,  9 },   { ERA_90S,    "1998", 3, 2,  0 },
+    { ERA_00S,    "2006", 4, 2,  9 },   { ERA_00S,    "2010", 2, 10, 13 },
+    { ERA_MODERN, "2018", 3, 2, 11 },   { ERA_MODERN, "2022", 4, 1,  2 },
 };
 static Moment gRounds[ROUNDS];
 
@@ -413,12 +421,18 @@ static void Spring(Vector3 *pos, Vector3 *vel, Vector3 target, float dt, float k
     *vel = Vector3Add(*vel, Vector3Scale(f, dt));
     *pos = Vector3Add(*pos, Vector3Scale(*vel, dt));
 }
-static void UpdateGloves(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR)
+static void UpdateGlovesK(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR, float k, float d)
 {
     g.kprAxis = Vector3Normalize(Vector3Lerp(g.kprAxis, tAxis, Clamp(13.0f*dt, 0.0f, 1.0f)));
-    Spring(&g.kprGL, &g.kprGLv, tGL, dt, 130.0f, 15.0f);
-    Spring(&g.kprGR, &g.kprGRv, tGR, dt, 130.0f, 15.0f);
+    Spring(&g.kprGL, &g.kprGLv, tGL, dt, k, d);
+    Spring(&g.kprGR, &g.kprGRv, tGR, dt, k, d);
 }
+static void UpdateGloves(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR)   // soft ragdoll (reactions)
+{ UpdateGlovesK(dt, tAxis, tGL, tGR, 130.0f, 15.0f); }
+// While the ball is live the hands lead toward it — a committed reach, not a
+// trailing follow — so the keeper's arms read as an extension of his attention.
+static void ReachForBall(float dt, Vector3 tAxis)
+{ UpdateGlovesK(dt, tAxis, GlovePos(-1), GlovePos(+1), 320.0f, 26.0f); }
 
 // ---- keeper reactions ---------------------------------------------------
 static void ComputeReactionPose(float t, float dt)
@@ -502,7 +516,7 @@ static void KeeperReact(float dt)
         g.kprPos = Vector3Add(g.kprPos, Vector3Scale(g.kprVel, dt));
         float sp = Vector3Length(g.kprVel);
         Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
-        UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1));
+        ReachForBall(dt, tA);                                 // stay reaching through the parry
         if (g.kprPos.y <= 0.42f) { g.kprPos.y = 0.42f; g.landed = true; g.reactT = 0.0f; g.reactBase = g.kprPos; g.reactAxis = g.kprAxis; }
     } else {
         g.reactT += dt;
@@ -538,11 +552,15 @@ static void SetupRound(int r)
 }
 static void ResetMatch(void)
 {
-    // sort the moments by their historical outcome -> ascending difficulty (target rises by 1 each round)
+    // draw ROUNDS distinct moments at random (Fisher-Yates), then order them by
+    // the opponent's tally -> ascending difficulty. Different every session.
     int n = (int)(sizeof(POOL)/sizeof(POOL[0]));
-    Moment t[8];
-    for (int i = 0; i < n; i++) t[i] = POOL[i];
-    for (int i = 0; i < n; i++) for (int j = i+1; j < n; j++)
+    int idx[32];
+    for (int i = 0; i < n; i++) idx[i] = i;
+    for (int i = n - 1; i > 0; i--) { int j = GetRandomValue(0, i); int s = idx[i]; idx[i] = idx[j]; idx[j] = s; }
+    Moment t[ROUNDS];
+    for (int i = 0; i < ROUNDS; i++) t[i] = POOL[idx[i]];
+    for (int i = 0; i < ROUNDS; i++) for (int j = i+1; j < ROUNDS; j++)
         if (t[j].oppGoals < t[i].oppGoals) { Moment s = t[i]; t[i] = t[j]; t[j] = s; }
     for (int i = 0; i < ROUNDS; i++) gRounds[i] = t[i];
     g.round = 0; g.roundWon = false; g.gameWon = false; g.gameLost = false; g.celebrate = 0.0f;
@@ -870,8 +888,8 @@ static void DrawKeeper(void)
     fwd = Vector3Normalize(fwd);
 
     Vector3 hip      = Vector3Add(g.kprPos, Vector3Scale(up, -0.30f));
-    Vector3 shoulder = Vector3Add(g.kprPos, Vector3Scale(up,  0.26f));
-    Vector3 headPos  = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(up, 0.60f)), g.kprHeadOff);
+    Vector3 shoulder = Vector3Add(g.kprPos, Vector3Scale(up,  0.24f));
+    Vector3 headPos  = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(up, 0.74f)), g.kprHeadOff);  // raised so the chin clears the collar
 
     Color kit  = gHome.a;
     Color sock = gHome.b;
@@ -922,6 +940,12 @@ static void DrawKeeper(void)
     DrawCylinderEx(shR, g.kprGR, 0.09f, 0.06f, 8, kit);
     DrawSphere(g.kprGL, GLOVE_R, gHome.b);                       // gloves (hands)
     DrawSphere(g.kprGR, GLOVE_R, gHome.b);
+
+    // neck: a short skin column bridging collar to head, so a chin reads
+    Color neck = (Color){ (unsigned char)(gSkinTone[gFaceSel].r*0.86f), (unsigned char)(gSkinTone[gFaceSel].g*0.86f),
+                          (unsigned char)(gSkinTone[gFaceSel].b*0.86f), 255 };
+    DrawCylinderEx(Vector3Add(g.kprPos, Vector3Scale(up, 0.34f)),
+                   Vector3Add(headPos, Vector3Scale(up, -0.22f)), 0.135f, 0.12f, 10, neck);
 
     // ---- head: shaded skin sphere, its +Z pole (hair cap) aimed at "up" ----
     gHeadModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = gHeadTex[gFaceSel];
@@ -1014,7 +1038,7 @@ static void UpdateDrawFrame(void)
             TryScramble();                     // late lunge for a loose/slow ball
             { float sp = Vector3Length(g.kprVel);
               Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
-              UpdateGloves(sdt, tA, GlovePos(-1), GlovePos(+1)); }
+              ReachForBall(sdt, tA); }         // hands lead toward the ball
             StepBallLive(sdt);
             SpinBall(sdt);
             g.flight += dt;
@@ -1107,6 +1131,7 @@ int main(void)
 {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(900, 600, "Arcade - World Cup Penalty");
+    SetRandomSeed((unsigned int)time(NULL));   // fresh matchups every session
 
     LoadArt();                        // bake ball skin + keeper faces (needs the GL context)
 
