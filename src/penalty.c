@@ -25,6 +25,7 @@
 #define BACK_WALL      (GOAL_Z + 2.1f)   // stops balls before the stands (no through-fans)
 
 #define KPR_DIVE_SPEED  8.5f
+#define KPR_SHUF_SPEED  12.0f   // low lateral jolt is faster & flatter than the leaping dive
 #define KPR_HOME_Y      1.05f
 #define KPR_BODY        0.42f
 #define GLOVE_R         0.17f
@@ -58,6 +59,7 @@ typedef struct {
     Vector3 kprPos, kprVel;
     float   kprReact, kprDiveX, kprDiveH;
     bool    kprLaunched;
+    int     kprMove;                 // 0 = leaping dive, 1 = low lateral shuffle
     int     scrambleCount;
     float   scrambleCd;
     // keeper visual pose (sprung)
@@ -135,7 +137,7 @@ static const Sponsor SPONSORS[NSPON] = {
     { "LISA",       "runs your coding agents", { 20, 24, 32,255}, {120,220,140,255}, { 90,180,110,255} },
     { "vend",       "intent to backlog",       {228,120, 42,255}, { 24, 20, 16,255}, {255,222,120,255} },
     { "PLANTASTIC", "plan a garden",           { 28,118, 70,255}, {240,246,236,255}, {150,212,120,255} },
-    { "PIVOTAL IQ", "find the grants",         { 22, 40, 92,255}, {236,240,250,255}, {110,150,235,255} },
+    { "CONSECUTIVE", "five in a row",          { 22,108,112,255}, {240,246,244,255}, {245,210, 90,255} },
     { "ROWCLEAR",   "falling blocks",          { 62, 42,112,255}, {245,240,255,255}, {170,122,240,255} },
 };
 static Texture2D gBannerTex[NSPON];
@@ -232,22 +234,45 @@ static void BuildExprSvg(char *b, int expr)
     o += sprintf(b+o, "<path d='M50,53 L45,65 L55,65' fill='none' stroke='#00000022' stroke-width='2.5'/>");
     o += sprintf(b+o, "%s</svg>", mouth);
 }
-// A retro advertising hoarding: chunky raylib pixel-font on a team-colored board.
+static Color Mix(Color a, Color b, float t)
+{
+    return (Color){ (unsigned char)(a.r + (b.r-a.r)*t), (unsigned char)(a.g + (b.g-a.g)*t),
+                    (unsigned char)(a.b + (b.b-a.b)*t), 255 };
+}
+// A pitch-side hoarding with a b28 "app-icon" logo tile, a glossy graded board and
+// a shadowed wordmark. Baked at 2x and downsampled so the pixel font reads clean.
 static Texture2D BakeBanner(Sponsor s)
 {
-    const int W = 512, H = 128;
-    Image im = GenImageColor(W, H, s.bg);
-    ImageDrawRectangle(&im, 0, 0, W, 12, s.accent);                 // top/bottom rails
-    ImageDrawRectangle(&im, 0, H-12, W, 12, s.accent);
-    for (int i = 0; i < W/24; i++)                                  // pixel-block trim
-        ImageDrawRectangle(&im, i*24 + (i%2?6:0), (i%2)?2:H-10, 12, 8, s.fg);
-    Font f = GetFontDefault();
-    Vector2 nm = MeasureTextEx(f, s.name, 52, 4);
-    ImageDrawTextEx(&im, f, s.name, (Vector2){ (W-nm.x)/2, 28 }, 52, 4, s.fg);
-    if (s.tag) {
-        Vector2 tg = MeasureTextEx(f, s.tag, 18, 2);
-        ImageDrawTextEx(&im, f, s.tag, (Vector2){ (W-tg.x)/2, 92 }, 18, 2, s.accent);
+    const int S = 2, W = 512*S, H = 128*S;
+    unsigned char *px = (unsigned char *)malloc((size_t)W*H*4);
+    Color hi = Mix(s.bg, (Color){255,255,255,255}, 0.16f), lo = Mix(s.bg, (Color){0,0,0,255}, 0.34f);
+    for (int y = 0; y < H; y++) {                                   // vertical gloss: sheen up top, shadow below
+        float v = (float)y / (H-1);
+        Color row = (v < 0.5f) ? Mix(hi, s.bg, v*2.0f) : Mix(s.bg, lo, (v-0.5f)*2.0f);
+        for (int x = 0; x < W; x++) { unsigned char *p = px+((size_t)y*W+x)*4; p[0]=row.r; p[1]=row.g; p[2]=row.b; p[3]=255; }
     }
+    Image im = { px, W, H, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+    ImageDrawRectangle(&im, 0, 0, W, 5*S, s.accent);               // top / bottom accent rails
+    ImageDrawRectangle(&im, 0, H-5*S, W, 5*S, s.accent);
+
+    int pad = 17*S, ts = H - 2*pad;                                // logo tile (rounded-clay feel via a bevel)
+    ImageDrawRectangle(&im, pad, pad, ts, ts, Mix(s.accent, (Color){0,0,0,255}, 0.18f));
+    ImageDrawRectangle(&im, pad, pad, ts, ts/2, Mix(s.accent, (Color){255,255,255,255}, 0.12f));
+    ImageDrawRectangle(&im, pad+2*S, pad+3*S, ts-4*S, ts-5*S, s.accent);
+    Font f = GetFontDefault();
+    char init[2] = { (char)(s.name[0]>='a'&&s.name[0]<='z' ? s.name[0]-32 : s.name[0]), 0 };
+    float ifs = ts*0.6f; Vector2 iz = MeasureTextEx(f, init, ifs, 1);
+    ImageDrawTextEx(&im, f, init, (Vector2){ pad + (ts-iz.x)/2, pad + (ts-iz.y)/2 }, ifs, 1, s.bg);
+
+    int tx = pad + ts + 20*S;                                      // wordmark + soft shadow
+    float nfs = 46*S, nsp = 3*S; Vector2 nz = MeasureTextEx(f, s.name, nfs, nsp);
+    float ny = (H - nz.y)/2 - 9*S;
+    ImageDrawTextEx(&im, f, s.name, (Vector2){ tx+2*S, ny+3*S }, nfs, nsp, (Color){0,0,0,90});
+    ImageDrawTextEx(&im, f, s.name, (Vector2){ tx, ny }, nfs, nsp, s.fg);
+    ImageDrawRectangle(&im, tx, (int)(ny+nz.y+5*S), (int)nz.x, 3*S, s.accent);   // accent underline
+    if (s.tag) ImageDrawTextEx(&im, f, s.tag, (Vector2){ tx, ny+nz.y+11*S }, 20*S, 1*S, Mix(s.fg, s.bg, 0.4f));
+
+    ImageResize(&im, 512, 128);                                    // downsample -> crisp
     Texture2D t = LoadTextureFromImage(im);
     SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
     UnloadImage(im);
@@ -387,7 +412,7 @@ static void ResetKeeper(void)
 {
     g.kprPos = (Vector3){ 0.0f, KPR_HOME_Y, GOAL_Z - 0.5f };
     g.kprVel = (Vector3){0};
-    g.kprReact = 0.0f; g.kprDiveX = 0.0f; g.kprDiveH = KPR_HOME_Y; g.kprLaunched = false;
+    g.kprReact = 0.0f; g.kprDiveX = 0.0f; g.kprDiveH = KPR_HOME_Y; g.kprLaunched = false; g.kprMove = 0;
     g.scrambleCount = 0; g.scrambleCd = 0.0f;
     g.kprAxis = (Vector3){0, 1, 0};
     g.kprGL = GlovePos(-1); g.kprGR = GlovePos(+1);
@@ -399,8 +424,15 @@ static void LaunchDive(void)
     Vector3 to = { g.kprDiveX - g.kprPos.x, 0.0f, (GOAL_Z - 0.45f) - g.kprPos.z };
     float d = Vector3Length(to);
     Vector3 dir = (d > 1e-4f) ? Vector3Scale(to, 1.0f/d) : (Vector3){0,0,0};
-    g.kprVel = Vector3Scale(dir, fminf(d / 0.32f, KPR_DIVE_SPEED));
-    g.kprVel.y = Clamp((g.kprDiveH - g.kprPos.y) / 0.32f + 2.2f, -1.0f, 6.5f);
+    if (g.kprMove == 1) {
+        // low lateral jolt: drive sideways fast and *down* to the corner — no hop,
+        // so the keeper collapses onto a ground-hugging ball instead of leaping over it
+        g.kprVel = Vector3Scale(dir, fminf(d / 0.24f, KPR_SHUF_SPEED));
+        g.kprVel.y = Clamp((g.kprDiveH - g.kprPos.y) / 0.20f, -3.4f, 0.6f);
+    } else {
+        g.kprVel = Vector3Scale(dir, fminf(d / 0.32f, KPR_DIVE_SPEED));
+        g.kprVel.y = Clamp((g.kprDiveH - g.kprPos.y) / 0.32f + 2.2f, -1.0f, 6.5f);   // spring up into the leap
+    }
     g.kprLaunched = true;
 }
 static void StepKeeper(float dt)
@@ -614,11 +646,22 @@ static void CommitKeeperDive(void)
     Ball p = g.ball;
     for (int i = 0; i < 500 && p.pos.z < GOAL_Z; i++) BallStep(&p, 0.01f);
     float px = p.pos.x, py = p.pos.y;
-    float err = Frand2() * 1.9f;
-    if (Frand() < 0.18f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;
-    g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
-    g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
-    g.kprReact = 0.16f + Frand() * 0.12f; g.kprLaunched = false; g.kprVel = (Vector3){0};
+
+    // Low-and-wide balls hug the ground into a corner — the leaping dive hops over
+    // them. For those, pick the low lateral shuffle: it reads quicker, commits
+    // closer to the real corner, and stays down. (Still fallible: err + the
+    // wrong-way guess remain, so it's a fighting chance, not a wall.)
+    bool lowWide = (py < 0.85f) && (fabsf(px) > 1.6f);
+    g.kprMove = lowWide ? 1 : 0;
+
+    float err = Frand2() * (lowWide ? 1.15f : 1.9f);              // reads the low roller a touch better
+    if (Frand() < (lowWide ? 0.12f : 0.18f)) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;   // still guesses wrong sometimes
+    float reachX = lowWide ? 0.94f : 0.8f;                        // shuffle commits nearer the post
+    g.kprDiveX = Clamp(px * reachX + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
+    g.kprDiveH = lowWide ? Clamp(py * 0.9f + 0.12f, 0.25f, 0.95f)
+                         : Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
+    g.kprReact = (lowWide ? 0.12f : 0.16f) + Frand() * 0.11f;
+    g.kprLaunched = false; g.kprVel = (Vector3){0};
 
     // Arm a bullet-time replay from what we can already predict: how near the
     // keeper's dive lands to the ball's line, and whether it rattles the post.
