@@ -32,6 +32,7 @@
 #define SHOULDER        0.32f
 #define SHOULDER_Y      0.25f
 #define SETTLE_TIME     1.6f
+#define REACT_DUR       2.2f
 
 #define NET_NX         17
 #define NET_NY         11
@@ -50,6 +51,11 @@ typedef struct {
     Vector3 kprPos, kprVel;
     float   kprReact, kprDiveX, kprDiveH;
     bool    kprLaunched;
+    // keeper reaction (celebration / frustration)
+    Vector3 kprAxis, kprGL, kprGR, kprHeadOff, reactBase;
+    int     reactAnim;
+    bool    reactCelebrate, reactOnGround, landed;
+    float   reactT;
     // flow
     int     kick, scored;
     Result  result;
@@ -212,7 +218,7 @@ static void StartKick(void)
     ResetKeeper();
     InitNet();
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
-    g.resultTimer = 0.0f; g.flight = 0.0f;
+    g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f;
 }
 
 static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
@@ -246,6 +252,18 @@ static void Resolve(Result r)
 {
     g.result = r; g.resolved = true; g.resultTimer = 0.0f;
     if (r == RES_GOAL) { g.scored++; g.celebrate = 1.7f; }
+
+    // pick the keeper's reaction
+    g.reactAnim = GetRandomValue(0, 4);
+    g.reactCelebrate = (r != RES_GOAL);         // happy unless it was beaten
+    g.reactT = 0.0f;
+    g.kprHeadOff = (Vector3){0};
+    if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
+        g.landed = true;  g.reactOnGround = false;                     // caught on its feet
+        g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z };
+    } else {
+        g.landed = false; g.reactOnGround = true;                      // will flop, then rise
+    }
 }
 
 static void StepBallLive(float dt)
@@ -363,6 +381,76 @@ static void DrawPitch(void)
     DrawCube((Vector3){0, 0.02f, 0}, 0.22f, 0.03f, 0.22f, (Color){235,238,240,220}); // penalty spot
 }
 
+// ---- keeper reactions (celebration / frustration) -----------------------
+static void ComputeReactionPose(float t)
+{
+    const float standY = 1.05f, groundY = 0.42f;
+    g.kprHeadOff = (Vector3){0};
+
+    float up;
+    if (!g.reactOnGround)   up = 1.0f;
+    else if (t < 0.5f)      up = 0.0f;                  // on the ground
+    else if (t < 1.0f)      up = (t - 0.5f) / 0.5f;     // getting up
+    else                    up = 1.0f;                  // standing
+    up = up*up*(3.0f - 2.0f*up);                        // smoothstep
+
+    Vector3 diveDir = { (g.reactBase.x >= 0 ? 1.0f : -1.0f), 0.0f, 0.0f };
+    Vector3 center  = { g.reactBase.x, Lerp(groundY - 0.05f, standY, up), g.reactBase.z };
+    Vector3 axis    = Vector3Normalize(Vector3Lerp(diveDir, (Vector3){0,1,0}, up));
+    Vector3 gl = { -0.4f, 0.15f, 0.0f }, gr = { 0.4f, 0.15f, 0.0f };
+
+    float lt = fmaxf(0.0f, t - (g.reactOnGround ? 1.0f : 0.0f));   // time spent standing
+    float w  = lt * 6.0f;
+
+    if (g.reactCelebrate) {
+        switch (g.reactAnim) {
+        case 0: gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f;
+                center.y += fabsf(sinf(w))*0.05f*up; break;                                    // fist pumps
+        case 1: gl = (Vector3){-0.7f,0.4f,0.0f}; gr = (Vector3){0.7f,0.4f,0.0f};
+                center.x += sinf(w*0.5f)*0.15f*up;
+                axis = Vector3Normalize((Vector3){ sinf(w*0.5f)*0.22f, 1.0f, 0.0f }); break;   // arms wide, sway
+        case 2: center.y += fabsf(sinf(w*0.7f))*0.4f*up;
+                gl = (Vector3){-0.3f,0.7f,0.0f}; gr = (Vector3){0.3f,0.7f,0.0f}; break;         // jump, arms up
+        case 3: gr = (Vector3){0.22f,0.78f,0.1f}; gl = (Vector3){-0.35f,0.0f,0.0f};
+                center.y += fabsf(sinf(w*0.8f))*0.08f*up; break;                               // point to sky
+        case 4: gl = (Vector3){-0.34f,0.46f,0.12f}; gr = (Vector3){0.34f,0.46f,0.12f};
+                center.y += fabsf(sinf(w))*0.06f*up; break;                                    // bicep flex
+        }
+    } else {
+        switch (g.reactAnim) {
+        case 0: if (up < 0.5f) { gl = (Vector3){-0.3f,-0.25f,0.3f}; gr = (Vector3){0.3f,-0.25f,0.3f}; }
+                else           { gl = (Vector3){-0.3f,0.5f,0.1f};  gr = (Vector3){0.3f,0.5f,0.1f}; } break; // ground slam -> anguish
+        case 1: gl = (Vector3){-0.16f,0.6f,0.16f}; gr = (Vector3){0.16f,0.6f,0.16f};
+                axis = Vector3Normalize(Vector3Lerp(axis, (Vector3){0,1,-0.4f}, up)); break;   // head in hands, slump
+        case 2: center.x += sinf(w*1.6f)*0.08f*up; gr.y = 0.1f + fabsf(sinf(w))*0.25f; break;  // stomp / kick
+        case 3: gl = (Vector3){-0.32f,0.05f,0.0f}; gr = (Vector3){0.32f,0.05f,0.0f};
+                g.kprHeadOff = (Vector3){ sinf(w)*0.12f, 0.0f, 0.0f }; break;                   // hands on hips, shake head
+        case 4: gl = (Vector3){-0.45f,-0.2f,0.0f}; gr = (Vector3){0.45f,-0.2f,0.0f};
+                center.x += sinf(w*0.35f)*0.12f*up; break;                                      // fling arms, turn away
+        }
+    }
+
+    g.kprPos  = center;
+    g.kprAxis = axis;
+    g.kprGL   = Vector3Add(center, gl);
+    g.kprGR   = Vector3Add(center, gr);
+}
+
+static void KeeperReact(float dt)
+{
+    if (!g.landed) {                          // let the dive finish — fall to the turf
+        g.kprVel.y -= 11.0f * dt;
+        g.kprPos = Vector3Add(g.kprPos, Vector3Scale(g.kprVel, dt));
+        float sp = Vector3Length(g.kprVel);
+        g.kprAxis = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
+        g.kprGL = GlovePos(-1); g.kprGR = GlovePos(+1);
+        if (g.kprPos.y <= 0.42f) { g.kprPos.y = 0.42f; g.landed = true; g.reactT = 0.0f; g.reactBase = g.kprPos; }
+    } else {
+        g.reactT += dt;
+        ComputeReactionPose(g.reactT);
+    }
+}
+
 // ---- main frame ---------------------------------------------------------
 static void UpdateDrawFrame(void)
 {
@@ -396,14 +484,17 @@ static void UpdateDrawFrame(void)
     } break;
 
     case PHASE_FLY: {
-        StepKeeper(dt);
         StepNet(dt);
-        if (!g.resolved) StepBallLive(dt);
-        else             StepBallSettle(dt);
-        if (!g.resolved) { g.flight += dt; if (g.flight > 4.0f) Resolve(g.hitWood ? RES_POST : RES_MISS); }
-        if (g.resolved) {
+        if (!g.resolved) {
+            StepKeeper(dt);
+            StepBallLive(dt);
+            g.flight += dt;
+            if (!g.resolved && g.flight > 4.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
+        } else {
+            KeeperReact(dt);
+            StepBallSettle(dt);
             g.resultTimer += dt;
-            if (g.resultTimer > SETTLE_TIME) {
+            if (g.landed && g.reactT > REACT_DUR) {
                 g.kick++;
                 if (g.kick >= KICKS_TOTAL) g.phase = PHASE_RESULT;
                 else StartKick();
@@ -413,6 +504,7 @@ static void UpdateDrawFrame(void)
 
     case PHASE_RESULT:
         StepNet(dt);
+        KeeperReact(dt);
         if (IsKeyPressed(KEY_ENTER)) ResetMatch();
         break;
     }
@@ -431,17 +523,24 @@ static void UpdateDrawFrame(void)
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
 
-        {   // keeper body: a capsule that lies along the dive — headfirst, not upright
-            Vector3 axis = (Vector3){0, 1, 0};
-            float sp = Vector3Length(g.kprVel);
-            if (g.kprLaunched && sp > 1.0f) axis = Vector3Scale(g.kprVel, 1.0f/sp);
-            Vector3 head = Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f));
+        {   // keeper: flight pose from dive velocity, or the reaction pose when resolved
+            Vector3 axis, gL, gR, headExtra = (Vector3){0};
+            if (g.resolved) { axis = g.kprAxis; gL = g.kprGL; gR = g.kprGR; headExtra = g.kprHeadOff; }
+            else {
+                axis = (Vector3){0, 1, 0};
+                float sp = Vector3Length(g.kprVel);
+                if (g.kprLaunched && sp > 1.0f) axis = Vector3Scale(g.kprVel, 1.0f/sp);
+                gL = GlovePos(-1); gR = GlovePos(+1);
+            }
+            Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), headExtra);
             Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
-            DrawCapsule(feet, head, 0.26f, 8, 8, (Color){ 240, 190, 40, 255 });
+            Color body = !g.resolved ? (Color){240,190,40,255}
+                       : (g.reactCelebrate ? (Color){250,205,55,255} : (Color){205,150,40,255});
+            DrawCapsule(feet, head, 0.26f, 8, 8, body);
             DrawSphere(head, 0.17f, (Color){ 250, 225, 130, 255 });
+            DrawSphere(gL, GLOVE_R, (Color){ 40, 210, 235, 255 });
+            DrawSphere(gR, GLOVE_R, (Color){ 40, 210, 235, 255 });
         }
-        DrawSphere(GlovePos(-1), GLOVE_R, (Color){ 40, 210, 235, 255 });
-        DrawSphere(GlovePos(+1), GLOVE_R, (Color){ 40, 210, 235, 255 });
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
 
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
