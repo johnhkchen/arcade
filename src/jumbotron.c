@@ -46,10 +46,17 @@ void DrawJumbotron(Rectangle r, BoardData d, float t)
                  ts, mono ? accent : (Color){130,150,185,255});
     }
 
+    // subtitle (target to beat)
+    if (d.sub) {
+        int ss = FitFont(d.sub, (int)(r.height*0.13f), (int)(r.width*0.8f));
+        DrawText(d.sub, (int)(r.x + r.width/2 - MeasureText(d.sub, ss)/2.0f), (int)(r.y + r.height*0.23f), ss,
+                 mono ? accent : (Color){205,185,95,255});
+    }
+
     // big center line (a hair of flicker on the old boards)
     if (d.big) {
-        int bs = FitFont(d.big, (int)(r.height*0.34f), (int)(r.width*0.88f));
-        int bx = (int)(r.x + r.width/2 - MeasureText(d.big, bs)/2.0f), by = (int)(r.y + r.height*0.34f);
+        int bs = FitFont(d.big, (int)(r.height*0.30f), (int)(r.width*0.88f));
+        int bx = (int)(r.x + r.width/2 - MeasureText(d.big, bs)/2.0f), by = (int)(r.y + r.height*0.42f);
         Color bc = mono ? ink : d.bigColor;
         if (d.era == ERA_70S) DrawText(d.big, bx+2, by+2, bs, Dim(ink, 0.32f));   // bulb glow/ghost
         if (mono && (int)(t*8) % 24 == 0) bc = Dim(bc, 0.7f);                     // faint flicker
@@ -60,7 +67,7 @@ void DrawJumbotron(Rectangle r, BoardData d, float t)
     if (d.dots > 0) {
         float dr = r.height*0.05f;
         float gap = fminf(r.width*0.85f/d.dots, dr*3.4f);
-        float sx = r.x + r.width/2 - (d.dots-1)*gap/2.0f, dy = r.y + r.height*0.82f;
+        float sx = r.x + r.width/2 - (d.dots-1)*gap/2.0f, dy = r.y + r.height*0.86f;
         for (int i = 0; i < d.dots; i++) {
             float x = sx + i*gap;
             Color dc;

@@ -14,8 +14,9 @@ typedef enum { ERA_70S, ERA_90S, ERA_00S, ERA_MODERN, ERA_COUNT } BoardEra;
 typedef struct {
     BoardEra    era;
     const char *year;              // small corner label, e.g. "1978"
-    const char *title;             // e.g. "PENALTY SHOOTOUT" / "FULL TIME"
-    const char *big;               // center line, e.g. "GOAL!" / "SCORED 3"
+    const char *title;             // top line, e.g. "ROUND 2 / 3"
+    const char *sub;               // subtitle, e.g. "BEAT 4"
+    const char *big;               // center line, e.g. "GOAL!" / "YOU 3"
     Color       bigColor;          // used by color eras (mono eras override)
     Color       homeA, homeB, awayA, awayB;
     int         dots;              // number of kick slots (<= 12)

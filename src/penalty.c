@@ -58,9 +58,9 @@ typedef struct {
     bool    reactCelebrate, reactOnGround, landed, reactHeld;
     float   reactT;
     // flow
-    int     kick, scored;
+    int     kick, scored, round, target;
     Result  result, kickRes[KICKS_TOTAL];
-    bool    resolved, caught, hitWood;
+    bool    resolved, caught, hitWood, roundWon, gameWon, gameLost;
     float   resultTimer, celebrate, flight;
     // touch input
     bool    touchCharge;
@@ -81,7 +81,15 @@ static const Team TEAMS[] = {
 };
 static Team gHome, gAway;
 static BoardEra gEra;
-static const char *ERA_YEARS[ERA_COUNT] = { "1978", "1994", "2006", "2022" };
+#define ROUNDS 3
+// A historical shootout: its era look, year, how many the OPPONENT scored, and the two kits.
+typedef struct { BoardEra era; const char *year; int oppGoals; int home, away; } Moment;
+static const Moment POOL[] = {
+    { ERA_00S,    "2006", 4, 4, 0 },
+    { ERA_70S,    "1978", 2, 1, 6 },
+    { ERA_90S,    "1994", 3, 3, 5 },
+};
+static Moment gRounds[ROUNDS];
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
@@ -341,15 +349,26 @@ static void StartKick(void)
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
     g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
 }
+static void SetupRound(int r)
+{
+    Moment m = gRounds[r];
+    gEra = m.era; gHome = TEAMS[m.home]; gAway = TEAMS[m.away];
+    g.target = m.oppGoals;                               // beat the opponent's tally
+    for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
+    g.kick = 0; g.scored = 0;
+    StartKick();
+}
 static void ResetMatch(void)
 {
-    int n = (int)(sizeof(TEAMS)/sizeof(TEAMS[0]));
-    int hi = GetRandomValue(0, n-1), ai = GetRandomValue(0, n-2);
-    if (ai >= hi) ai++;                                  // distinct matchup
-    gHome = TEAMS[hi]; gAway = TEAMS[ai];
-    for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
-    gEra = (BoardEra)GetRandomValue(0, ERA_COUNT-1);
-    g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick();
+    // sort the moments by their historical outcome -> ascending difficulty (target rises by 1 each round)
+    int n = (int)(sizeof(POOL)/sizeof(POOL[0]));
+    Moment t[8];
+    for (int i = 0; i < n; i++) t[i] = POOL[i];
+    for (int i = 0; i < n; i++) for (int j = i+1; j < n; j++)
+        if (t[j].oppGoals < t[i].oppGoals) { Moment s = t[i]; t[i] = t[j]; t[j] = s; }
+    for (int i = 0; i < ROUNDS; i++) gRounds[i] = t[i];
+    g.round = 0; g.roundWon = false; g.gameWon = false; g.gameLost = false; g.celebrate = 0.0f;
+    SetupRound(0);
 }
 
 static Strike AimStrike(void)
@@ -473,13 +492,17 @@ static void DrawBoardOverlay(void)   // project the board rect + render the live
     Rectangle rect = { (W - bw) * 0.5f, H * 0.03f, bw, bw / 3.3f };   // fixed top-center panel
 
     BoardData bd = (BoardData){0};
-    bd.era = gEra; bd.year = ERA_YEARS[gEra]; bd.title = "PENALTY SHOOTOUT";
-    if (g.phase == PHASE_FLY && g.resolved) {
+    bd.era = gEra; bd.year = gRounds[g.round].year;
+    bd.title = TextFormat("ROUND %d / %d", g.round+1, ROUNDS);
+    bd.sub   = TextFormat("BEAT %d", g.target);
+    if (g.phase == PHASE_RESULT) {
+        if (g.gameWon)       { bd.title = "CHAMPIONS"; bd.sub = "you win the cup"; bd.big = "WINNERS"; bd.bigColor = (Color){250,215,70,255}; }
+        else if (g.gameLost) { bd.title = "GAME OVER"; bd.sub = TextFormat("scored %d, needed %d", g.scored, g.target+1); bd.big = "OUT"; bd.bigColor = (Color){235,90,90,255}; }
+        else                 { bd.title = "ROUND CLEARED"; bd.sub = TextFormat("scored %d", g.scored); bd.big = "ADVANCE"; bd.bigColor = (Color){90,220,120,255}; }
+    } else if (g.phase == PHASE_FLY && g.resolved) {
         bd.big = g.result==RES_GOAL?"GOAL!":g.result==RES_SAVE?"SAVED!":g.result==RES_POST?"WOODWORK!":"MISS!";
         bd.bigColor = g.result==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255};
-    } else if (g.phase == PHASE_RESULT) {
-        bd.title = "FULL TIME"; bd.big = TextFormat("%d / %d", g.scored, KICKS_TOTAL); bd.bigColor = RAYWHITE;
-    } else { bd.big = TextFormat("SCORED  %d", g.scored); bd.bigColor = RAYWHITE; }
+    } else { bd.big = TextFormat("YOU  %d", g.scored); bd.bigColor = RAYWHITE; }
     bd.homeA = gHome.a; bd.homeB = gHome.b; bd.awayA = gAway.a; bd.awayB = gAway.b;
     bd.dots = KICKS_TOTAL;
     for (int i = 0; i < KICKS_TOTAL; i++) {
@@ -591,14 +614,24 @@ static void UpdateDrawFrame(void)
             KeeperReact(dt); StepBallSettle(dt); g.resultTimer += dt;
             if (g.landed && g.reactT > REACT_DUR) {
                 g.kick++;
-                if (g.kick >= KICKS_TOTAL) g.phase = PHASE_RESULT; else StartKick();
+                int left = KICKS_TOTAL - g.kick;
+                bool decided = (g.scored > g.target) || (g.scored + left <= g.target) || (g.kick >= KICKS_TOTAL);
+                if (decided) {
+                    g.roundWon = (g.scored > g.target);
+                    if (!g.roundWon)             g.gameLost = true;
+                    else if (g.round >= ROUNDS-1) g.gameWon = true;
+                    g.phase = PHASE_RESULT;
+                } else StartKick();
             }
         }
     } break;
 
     case PHASE_RESULT:
         StepNet(dt); KeeperReact(dt);
-        if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ResetMatch();
+        if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            if (g.gameWon || g.gameLost) ResetMatch();
+            else { g.round++; SetupRound(g.round); }     // round cleared -> next round
+        }
         break;
     }
 
