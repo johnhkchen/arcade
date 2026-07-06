@@ -53,7 +53,7 @@ typedef struct {
     // flow
     int     kick, scored;
     Result  result;
-    bool    resolved;
+    bool    resolved, caught;
     float   resultTimer, celebrate;
     Camera3D cam;
 } Game;
@@ -183,10 +183,8 @@ static bool KeeperDeflect(void)
         Vector3 d = Vector3Subtract(g.ball.pos, col[i]);
         float len = Vector3Length(d);
         if (len < BALL_R + rad[i]) {
-            Vector3 n = (len > 1e-3f) ? Vector3Scale(d, 1.0f/len) : (Vector3){0, 0, -1};
-            float punch = fmaxf(0.0f, Vector3DotProduct(g.kprVel, n));
-            g.ball.vel = Vector3Add(Vector3Scale(Vector3Reflect(g.ball.vel, n), 0.5f),
-                                    Vector3Scale(n, punch * 0.9f + 2.5f));
+            g.ball.vel = (Vector3){0};    // grasped — held, never spills into the net
+            g.caught = true;
             return true;
         }
     }
@@ -203,7 +201,7 @@ static void StartKick(void)
     g.ball.pos = (Vector3){0.0f, BALL_R, 0.0f};
     ResetKeeper();
     InitNet();
-    g.result = RES_NONE; g.resolved = false; g.resultTimer = 0.0f;
+    g.result = RES_NONE; g.resolved = false; g.caught = false; g.resultTimer = 0.0f;
 }
 
 static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
@@ -272,6 +270,11 @@ static void StepBallLive(float dt)
 
 static void StepBallSettle(float dt)
 {
+    if (g.caught) {   // keeper cradles it — follow the diving body, never spills in
+        g.ball.pos = Vector3Add(g.kprPos, (Vector3){ 0.0f, -0.05f, -0.30f });
+        g.ball.vel = (Vector3){0};
+        return;
+    }
     const int N = 6;
     float backZ = GOAL_Z + NET_DEPTH;
     for (int i = 0; i < N; i++) {
