@@ -403,13 +403,37 @@ static void DrawNet(void)
 }
 
 // ---- keeper -------------------------------------------------------------
+// The keeper's shoulder in his OWN (possibly diving) frame — arms hinge from the
+// body as it tilts, not from a world-upright rig.
+static Vector3 KprShoulder(int side)
+{
+    Vector3 up = (Vector3Length(g.kprAxis) > 0.1f) ? Vector3Normalize(g.kprAxis) : (Vector3){0,1,0};
+    Vector3 sv = Vector3CrossProduct(up, (Vector3){0,0,1});
+    if (Vector3Length(sv) < 0.1f) sv = (Vector3){1,0,0};
+    sv = Vector3Normalize(sv);
+    return Vector3Add(g.kprPos, Vector3Add(Vector3Scale(sv, side*SHOULDER), Vector3Scale(up, SHOULDER_Y)));
+}
+// Where the hands should point: the spot the keeper has committed his dive to,
+// homing onto the actual ball only as it reaches the line. So the reach leads
+// toward where he's going, then closes onto the ball for the touch.
+static Vector3 SaveTarget(void)
+{
+    Vector3 commit = { g.kprDiveX, g.kprDiveH, GOAL_Z - 0.35f };
+    float t = Clamp((g.ball.pos.z - (GOAL_Z - 3.2f)) / 3.2f, 0.0f, 1.0f);
+    return Vector3Lerp(commit, g.ball.pos, t);
+}
 static Vector3 GlovePos(int side)
 {
-    Vector3 sh = Vector3Add(g.kprPos, (Vector3){ side * SHOULDER, SHOULDER_Y, 0.05f });
-    Vector3 toBall = Vector3Subtract(g.ball.pos, sh);
-    float d = Vector3Length(toBall);
-    if (d > ARM) toBall = Vector3Scale(toBall, ARM / d);
-    return Vector3Add(sh, toBall);
+    Vector3 up = (Vector3Length(g.kprAxis) > 0.1f) ? Vector3Normalize(g.kprAxis) : (Vector3){0,1,0};
+    Vector3 sv = Vector3CrossProduct(up, (Vector3){0,0,1});
+    if (Vector3Length(sv) < 0.1f) sv = (Vector3){1,0,0};
+    sv = Vector3Normalize(sv);
+    Vector3 sh  = KprShoulder(side);
+    Vector3 tgt = Vector3Add(SaveTarget(), Vector3Scale(sv, side*0.15f));   // keep hands shoulder-width, not clasped
+    Vector3 to = Vector3Subtract(tgt, sh);
+    float d = Vector3Length(to);
+    if (d > ARM) to = Vector3Scale(to, ARM / d);
+    return Vector3Add(sh, to);
 }
 static void ResetKeeper(void)
 {
@@ -1034,8 +1058,7 @@ static void DrawKeeper(void)
     }
 
     DrawCapsule(hip, shoulder, 0.30f, 12, 10, kit);              // rounded torso
-    Vector3 shL = Vector3Add(shoulder, Vector3Scale(side, -0.28f));
-    Vector3 shR = Vector3Add(shoulder, Vector3Scale(side,  0.28f));
+    Vector3 shL = KprShoulder(-1), shR = KprShoulder(+1);        // arms hinge where the reach originates
     DrawCylinderEx(shL, g.kprGL, 0.09f, 0.06f, 8, kit);          // upper arms -> gloves
     DrawCylinderEx(shR, g.kprGR, 0.09f, 0.06f, 8, kit);
     DrawSphere(g.kprGL, GLOVE_R, gHome.b);                       // gloves (hands)
