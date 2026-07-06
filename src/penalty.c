@@ -33,8 +33,8 @@
 #define SHOULDER_Y      0.25f
 #define SETTLE_TIME     1.6f
 
-#define NET_NX         13
-#define NET_NY          8
+#define NET_NX         17
+#define NET_NY         11
 
 typedef enum { PHASE_AIM, PHASE_CHARGE, PHASE_FLY, PHASE_RESULT } Phase;
 typedef enum { RES_NONE, RES_GOAL, RES_SAVE, RES_POST, RES_MISS } Result;
@@ -96,9 +96,9 @@ static void StepNet(float dt)
             NetNode *n = &gNet[r][c];
             if (n->pin) continue;
             Vector3 cur = n->p;
-            Vector3 v = Vector3Scale(Vector3Subtract(n->p, n->prev), 0.98f);
+            Vector3 v = Vector3Scale(Vector3Subtract(n->p, n->prev), 0.985f);
             n->p = Vector3Add(n->p, v);
-            n->p.y -= 8.0f * dt2;
+            n->p.y -= 9.5f * dt2;                              // a little more drape
             n->prev = cur;
         }
     // ball pushes the net backward (bulge)
@@ -109,15 +109,15 @@ static void StepNet(float dt)
                 NetNode *n = &gNet[r][c];
                 if (n->pin) continue;
                 float dx = n->p.x - g.ball.pos.x, dy = n->p.y - g.ball.pos.y;
-                if (dx*dx + dy*dy < 0.36f && g.ball.pos.z + BALL_R > n->p.z)
-                    n->p.z = g.ball.pos.z + BALL_R;
+                if (dx*dx + dy*dy < 0.55f && g.ball.pos.z + BALL_R > n->p.z)
+                    n->p.z += (g.ball.pos.z + BALL_R*1.4f - n->p.z) * 0.6f;   // soft give
             }
     // relax springs
-    for (int it = 0; it < 3; it++) {
+    for (int it = 0; it < 2; it++) {                          // fewer iters = slacker
         for (int r = 0; r < NET_NY; r++)
             for (int c = 0; c < NET_NX; c++) {
-                if (c+1 < NET_NX) Relax(&gNet[r][c], &gNet[r][c+1], gNetDx);
-                if (r+1 < NET_NY) Relax(&gNet[r][c], &gNet[r+1][c], gNetDy);
+                if (c+1 < NET_NX) Relax(&gNet[r][c], &gNet[r][c+1], gNetDx * 1.06f);
+                if (r+1 < NET_NY) Relax(&gNet[r][c], &gNet[r+1][c], gNetDy * 1.06f);
             }
     }
 }
@@ -315,6 +315,25 @@ static void DrawCrowd(void)
         }
 }
 
+// ---- pitch markings -----------------------------------------------------
+static void PitchLineH(float z, float x0, float x1)
+{ DrawCube((Vector3){(x0+x1)*0.5f, 0.02f, z}, fabsf(x1-x0), 0.03f, 0.12f, (Color){235,238,240,200}); }
+static void PitchLineV(float x, float z0, float z1)
+{ DrawCube((Vector3){x, 0.02f, (z0+z1)*0.5f}, 0.12f, 0.03f, fabsf(z1-z0), (Color){235,238,240,200}); }
+
+static void DrawPitch(void)
+{
+    const float PW = 20.15f, GW = 9.16f;
+    PitchLineH(GOAL_Z, -PW, PW);            // goal line
+    PitchLineH(-5.5f,  -PW, PW);            // penalty area front (16.5m)
+    PitchLineV(-PW, -5.5f, GOAL_Z);
+    PitchLineV( PW, -5.5f, GOAL_Z);
+    PitchLineH(5.5f, -GW, GW);              // goal area / 6-yard box front (5.5m)
+    PitchLineV(-GW, 5.5f, GOAL_Z);
+    PitchLineV( GW, 5.5f, GOAL_Z);
+    DrawCube((Vector3){0, 0.02f, 0}, 0.22f, 0.03f, 0.22f, (Color){235,238,240,220}); // penalty spot
+}
+
 // ---- main frame ---------------------------------------------------------
 static void UpdateDrawFrame(void)
 {
@@ -374,15 +393,23 @@ static void UpdateDrawFrame(void)
 
     BeginMode3D(g.cam);
         DrawCrowd();
-        DrawPlane((Vector3){0, 0, 9}, (Vector2){40, 30}, (Color){ 34, 78, 46, 255 });
-        DrawCircle3D((Vector3){0, 0.01f, 0}, 0.22f, (Vector3){1,0,0}, 90.0f, RAYWHITE);
+        DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
+        DrawPitch();
 
         DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
         DrawCube((Vector3){ GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
 
-        DrawCube(g.kprPos, 0.5f, KPR_BODY*2.2f, 0.35f, (Color){ 240, 190, 40, 255 });
+        {   // keeper body: a capsule that lies along the dive — headfirst, not upright
+            Vector3 axis = (Vector3){0, 1, 0};
+            float sp = Vector3Length(g.kprVel);
+            if (g.kprLaunched && sp > 1.0f) axis = Vector3Scale(g.kprVel, 1.0f/sp);
+            Vector3 head = Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f));
+            Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
+            DrawCapsule(feet, head, 0.26f, 8, 8, (Color){ 240, 190, 40, 255 });
+            DrawSphere(head, 0.17f, (Color){ 250, 225, 130, 255 });
+        }
         DrawSphere(GlovePos(-1), GLOVE_R, (Color){ 40, 210, 235, 255 });
         DrawSphere(GlovePos(+1), GLOVE_R, (Color){ 40, 210, 235, 255 });
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
