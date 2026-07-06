@@ -1,0 +1,9 @@
+{
+  "name": "arcade",
+  "compatibility_date": "2025-06-01",
+  "assets": { "directory": "./dist" }
+  // arcade.b28.dev is bound out-of-band via the account-level Workers Domains API
+  // (PUT /accounts/{id}/workers/domains) — the scoped CLOUDFLARE_API_TOKEN can't
+  // create the zone Workers route wrangler's `routes` uses (auth error 10000),
+  // so `routes` is intentionally omitted to keep `wrangler deploy` clean.
+}

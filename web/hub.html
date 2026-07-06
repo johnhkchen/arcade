@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>b28 arcade</title>
+  <style>
+    :root{ --bg:#faf8f5; --surface:#f7f3eb; --well:#ece7dd; --ink:#1c1917; --soft:#736b66; --blue:#44679b; --border:#e4ded2; }
+    *{ box-sizing:border-box; }
+    html,body{ margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,system-ui,"Segoe UI",sans-serif; -webkit-font-smoothing:antialiased; }
+    .wrap{ max-width:760px; margin:0 auto; padding:48px 20px 72px; }
+    h1{ font-family:Georgia,"Times New Roman",serif; font-size:40px; margin:0 0 6px; letter-spacing:-.5px; }
+    .tag{ color:var(--soft); font-size:17px; margin:0 0 34px; }
+    .grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:16px; }
+    a.card{ display:block; text-decoration:none; color:inherit; background:var(--surface); border-radius:16px; padding:18px;
+      box-shadow:0 12px 24px -12px color-mix(in srgb, var(--ink) 22%, transparent), inset 2px 2px 4px rgba(255,255,255,.7);
+      transition:transform .13s cubic-bezier(.2,0,0,1), box-shadow .13s; }
+    a.card:hover{ transform:translateY(-2px); }
+    .card.soon{ opacity:.6; pointer-events:none; }
+    .name{ font-weight:700; font-size:19px; margin-bottom:4px; }
+    .what{ color:var(--soft); font-size:14px; margin-bottom:12px; }
+    .pill{ display:inline-block; font-size:12px; font-weight:600; padding:3px 9px; border-radius:999px; background:var(--well); color:var(--soft); }
+    .pill.live{ background:var(--blue); color:#fff; }
+    footer{ margin-top:40px; color:var(--soft); font-size:13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Arcade</h1>
+    <p class="tag">Quick games. Open in your browser, play in seconds.</p>
+    <div class="grid">
+      <a class="card" href="/penalty/">
+        <div class="name">World Cup Penalty</div>
+        <div class="what">Aim, curl it, beat the keeper.</div>
+        <span class="pill live">Play</span>
+      </a>
+      <div class="card soon">
+        <div class="name">Home Run Contest</div>
+        <div class="what">Time the swing, send it deep.</div>
+        <span class="pill">Soon · Derby week</span>
+      </div>
+      <div class="card soon">
+        <div class="name">Golf</div>
+        <div class="what">The home-run swing, to a hole.</div>
+        <span class="pill">Soon</span>
+      </div>
+      <div class="card soon">
+        <div class="name">Star Fox Run</div>
+        <div class="what">Hit the targets, in 3D.</div>
+        <span class="pill">Soon</span>
+      </div>
+    </div>
+    <footer>b28.dev · a little arcade</footer>
+  </div>
+</body>
+</html>
