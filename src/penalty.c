@@ -1,12 +1,5 @@
 // penalty.c — Arcade cartridge #1: World Cup Penalty Shootout.
 // Skin #1 over the shared ballstrike core.
-//
-//  - keeper: two floating GLOVE colliders + torso on a body that DIVES ONCE,
-//    ballistically — it launches with a capped impulse and cannot recover, so a
-//    shot placed past its committed reach scores. Gloves punch with dive momentum.
-//  - net: a real Verlet mass-spring cloth pinned to the frame; the ball pushes it,
-//    it bulges and catches, then springs back. Ball keeps living after judgment.
-//  - a light crowd in the stand jumps to celebrate a goal.
 #include "raylib.h"
 #include "raymath.h"
 #include "ballstrike.h"
@@ -23,35 +16,38 @@
 #define POST_R          0.06f
 #define NET_DEPTH       1.4f
 #define KICKS_TOTAL     5
+#define BACK_WALL      (GOAL_Z + 2.1f)   // stops balls before the stands (no through-fans)
 
-#define KPR_DIVE_SPEED  8.5f    // capped horizontal dive speed — corners beat it
+#define KPR_DIVE_SPEED  8.5f
 #define KPR_HOME_Y      1.05f
 #define KPR_BODY        0.42f
 #define GLOVE_R         0.17f
 #define ARM             0.80f
 #define SHOULDER        0.32f
 #define SHOULDER_Y      0.25f
-#define SETTLE_TIME     1.6f
-#define REACT_DUR       2.2f
+#define REACT_DUR       2.8f
+#define SCRAMBLE_MAX    2
+#define SCRAMBLE_REACH  3.7f
+#define SCRAMBLE_SPEED  9.5f
 
 #define NET_NX         17
 #define NET_NY         11
 
 typedef enum { PHASE_AIM, PHASE_CHARGE, PHASE_FLY, PHASE_RESULT } Phase;
 typedef enum { RES_NONE, RES_GOAL, RES_SAVE, RES_POST, RES_MISS } Result;
-
 typedef struct { Vector3 p, prev; bool pin; } NetNode;
 
 typedef struct {
     Phase   phase;
-    float   yaw, pitch, curve;
-    float   power01, chargeDir;
+    float   yaw, pitch, curve, power01, chargeDir;
     Ball    ball;
     // keeper
     Vector3 kprPos, kprVel;
     float   kprReact, kprDiveX, kprDiveH;
     bool    kprLaunched;
-    // keeper reaction (celebration / frustration)
+    int     scrambleCount;
+    float   scrambleCd;
+    // keeper visual pose (sprung)
     Vector3 kprAxis, kprGL, kprGR, kprGLv, kprGRv, kprHeadOff, reactBase;
     int     reactAnim;
     bool    reactCelebrate, reactOnGround, landed, reactHeld;
@@ -61,10 +57,9 @@ typedef struct {
     Result  result;
     bool    resolved, caught, hitWood;
     float   resultTimer, celebrate, flight;
-    // touch / swipe input
-    bool    swipeActive;
-    Vector2 swipeStart, swipePrev, swipeDir;
-    float   swipeBend;
+    // touch input
+    bool    touchCharge;
+    float   pressX;
     Camera3D cam;
 } Game;
 
@@ -87,7 +82,6 @@ static void InitNet(void)
             gNet[r][c].pin = (r == 0 || r == NET_NY-1 || c == 0 || c == NET_NX-1);
         }
 }
-
 static void Relax(NetNode *a, NetNode *b, float rest)
 {
     Vector3 d = Vector3Subtract(b->p, a->p);
@@ -97,7 +91,6 @@ static void Relax(NetNode *a, NetNode *b, float rest)
     if (!a->pin) a->p = Vector3Add(a->p, corr);
     if (!b->pin) b->p = Vector3Subtract(b->p, corr);
 }
-
 static void StepNet(float dt)
 {
     float dt2 = dt*dt;
@@ -108,10 +101,9 @@ static void StepNet(float dt)
             Vector3 cur = n->p;
             Vector3 v = Vector3Scale(Vector3Subtract(n->p, n->prev), 0.985f);
             n->p = Vector3Add(n->p, v);
-            n->p.y -= 9.5f * dt2;                              // a little more drape
+            n->p.y -= 9.5f * dt2;
             n->prev = cur;
         }
-    // ball pushes the net backward (bulge)
     bool inGoal = g.ball.pos.z > GOAL_Z - 0.3f && fabsf(g.ball.pos.x) < GOAL_HALF_W + 0.3f && g.ball.pos.y < GOAL_H + 0.3f;
     if (inGoal)
         for (int r = 0; r < NET_NY; r++)
@@ -120,18 +112,15 @@ static void StepNet(float dt)
                 if (n->pin) continue;
                 float dx = n->p.x - g.ball.pos.x, dy = n->p.y - g.ball.pos.y;
                 if (dx*dx + dy*dy < 0.55f && g.ball.pos.z + BALL_R > n->p.z)
-                    n->p.z += (g.ball.pos.z + BALL_R*1.4f - n->p.z) * 0.6f;   // soft give
+                    n->p.z += (g.ball.pos.z + BALL_R*1.4f - n->p.z) * 0.6f;
             }
-    // relax springs
-    for (int it = 0; it < 2; it++) {                          // fewer iters = slacker
+    for (int it = 0; it < 2; it++)
         for (int r = 0; r < NET_NY; r++)
             for (int c = 0; c < NET_NX; c++) {
                 if (c+1 < NET_NX) Relax(&gNet[r][c], &gNet[r][c+1], gNetDx * 1.06f);
                 if (r+1 < NET_NY) Relax(&gNet[r][c], &gNet[r+1][c], gNetDy * 1.06f);
             }
-    }
 }
-
 static void DrawNet(void)
 {
     Color nc = (Color){ 215, 220, 226, 70 };
@@ -151,46 +140,53 @@ static Vector3 GlovePos(int side)
     if (d > ARM) toBall = Vector3Scale(toBall, ARM / d);
     return Vector3Add(sh, toBall);
 }
-
 static void ResetKeeper(void)
 {
     g.kprPos = (Vector3){ 0.0f, KPR_HOME_Y, GOAL_Z - 0.5f };
     g.kprVel = (Vector3){0};
-    g.kprReact = 0.0f; g.kprDiveX = 0.0f; g.kprDiveH = KPR_HOME_Y;
-    g.kprLaunched = false;
+    g.kprReact = 0.0f; g.kprDiveX = 0.0f; g.kprDiveH = KPR_HOME_Y; g.kprLaunched = false;
+    g.scrambleCount = 0; g.scrambleCd = 0.0f;
     g.kprAxis = (Vector3){0, 1, 0};
     g.kprGL = GlovePos(-1); g.kprGR = GlovePos(+1);
     g.kprGLv = (Vector3){0}; g.kprGRv = (Vector3){0};
     g.kprHeadOff = (Vector3){0};
 }
-
-// one-time ballistic dive launch; capped so far/high corners can't be reached
 static void LaunchDive(void)
 {
-    Vector3 to = (Vector3){ g.kprDiveX - g.kprPos.x, 0.0f, (GOAL_Z - 0.45f) - g.kprPos.z };
+    Vector3 to = { g.kprDiveX - g.kprPos.x, 0.0f, (GOAL_Z - 0.45f) - g.kprPos.z };
     float d = Vector3Length(to);
     Vector3 dir = (d > 1e-4f) ? Vector3Scale(to, 1.0f/d) : (Vector3){0,0,0};
-    float hspeed = fminf(d / 0.32f, KPR_DIVE_SPEED);
-    g.kprVel = Vector3Scale(dir, hspeed);
+    g.kprVel = Vector3Scale(dir, fminf(d / 0.32f, KPR_DIVE_SPEED));
     g.kprVel.y = Clamp((g.kprDiveH - g.kprPos.y) / 0.32f + 2.2f, -1.0f, 6.5f);
     g.kprLaunched = true;
 }
-
 static void StepKeeper(float dt)
 {
     if (!g.kprLaunched) {
         if (g.kprReact > 0.0f) { g.kprReact -= dt; if (g.kprReact <= 0.0f) LaunchDive(); }
         return;
     }
-    // committed: gravity only, no steering, no recovery
-    g.kprVel.y -= 11.0f * dt;
+    g.kprVel.y -= 11.0f * dt;                                    // committed: gravity only
     g.kprPos = Vector3Add(g.kprPos, Vector3Scale(g.kprVel, dt));
     if (g.kprPos.y < 0.42f) { g.kprPos.y = 0.42f; g.kprVel.y = 0.0f; g.kprVel.x *= 0.9f; g.kprVel.z *= 0.9f; }
 }
-
+// A late lunge for a loose/slow ball near the goal — reuses the same glove/catch logic.
+static void TryScramble(void)
+{
+    if (g.resolved || !g.kprLaunched || g.scrambleCount >= SCRAMBLE_MAX || g.scrambleCd > 0.0f) return;
+    float dx = g.ball.pos.x - g.kprPos.x, dz = g.ball.pos.z - g.kprPos.z;
+    float dist = sqrtf(dx*dx + dz*dz);
+    bool nearGoal = g.ball.pos.z > GOAL_Z - 4.0f && g.ball.pos.z < GOAL_Z + 0.2f;
+    if (nearGoal && Vector3Length(g.ball.vel) < 7.0f && dist > 0.5f && dist < SCRAMBLE_REACH) {
+        Vector3 dir = { dx/dist, 0.0f, dz/dist };
+        g.kprVel = Vector3Scale(dir, fminf(dist / 0.22f, SCRAMBLE_SPEED));
+        g.kprVel.y = 2.6f;                                        // hop into the lunge
+        g.scrambleCount++; g.scrambleCd = 0.45f;
+    }
+}
 static bool KeeperDeflect(void)
 {
-    if (g.ball.pos.z < GOAL_Z - 1.6f) return false;
+    if (g.ball.pos.z < GOAL_Z - 4.0f) return false;
     Vector3 col[3] = { g.kprPos, GlovePos(-1), GlovePos(+1) };
     float    rad[3] = { KPR_BODY, GLOVE_R, GLOVE_R };
     for (int i = 0; i < 3; i++) {
@@ -201,192 +197,13 @@ static bool KeeperDeflect(void)
             float punch = fmaxf(0.0f, Vector3DotProduct(g.kprVel, n));
             Vector3 parry = Vector3Add(Vector3Scale(Vector3Reflect(g.ball.vel, n), 0.5f),
                                        Vector3Scale(n, punch * 0.9f + 2.5f));
-            parry.y += 1.5f;                       // a little lift — nicer deflection
-            if (parry.z < -0.6f) {                 // heading clearly out: parry it away
-                g.ball.vel = parry;
-                g.caught = false;
-            } else {                               // a parry would risk the net: catch it
-                g.ball.vel = (Vector3){0};
-                g.caught = true;
-            }
+            parry.y += 1.5f;
+            if (parry.z < -0.6f) { g.ball.vel = parry; g.caught = false; }   // safe deflection
+            else                 { g.ball.vel = (Vector3){0}; g.caught = true; g.ball.spin = (Vector3){0}; }
             return true;
         }
     }
     return false;
-}
-
-// ---- flow ---------------------------------------------------------------
-static void StartKick(void)
-{
-    g.phase = PHASE_AIM;
-    g.yaw = 0.0f; g.pitch = 0.16f; g.curve = 0.0f;
-    g.power01 = 0.0f; g.chargeDir = 1.0f;
-    g.ball = (Ball){0};
-    g.ball.pos = (Vector3){0.0f, BALL_R, 0.0f};
-    ResetKeeper();
-    InitNet();
-    g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
-    g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f;
-}
-
-static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
-
-static Strike AimStrike(void)
-{
-    float scatter = g.power01 * 0.05f;
-    return (Strike){
-        .power = 13.0f + g.power01 * 16.0f,
-        .yaw   = g.yaw   + Frand2() * scatter,
-        .pitch = g.pitch + Frand2() * scatter * 0.6f,
-        .curve = g.curve * 3.0f,
-    };
-}
-
-static void CommitKeeperDive(void)
-{
-    Ball p = g.ball;
-    for (int i = 0; i < 500 && p.pos.z < GOAL_Z; i++) BallStep(&p, 0.01f);
-    float px = p.pos.x, py = p.pos.y;
-    float err = Frand2() * 1.9f;
-    if (Frand() < 0.18f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;
-    g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
-    g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
-    g.kprReact = 0.16f + Frand() * 0.12f;
-    g.kprLaunched = false;
-    g.kprVel = (Vector3){0};
-}
-
-static void Resolve(Result r)
-{
-    g.result = r; g.resolved = true; g.resultTimer = 0.0f;
-    if (r == RES_GOAL) { g.scored++; g.celebrate = 1.7f; }
-
-    // pick the keeper's reaction
-    g.reactAnim = GetRandomValue(0, 4);
-    g.reactCelebrate = (r != RES_GOAL);         // happy unless it was beaten
-    g.reactHeld = (r == RES_SAVE && g.caught);   // did it CATCH the ball (vs parry / no touch)?
-    g.reactT = 0.0f;
-    g.kprHeadOff = (Vector3){0};
-    if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
-        g.landed = true;  g.reactOnGround = false;                     // caught on its feet
-        g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z };
-    } else {
-        g.landed = false; g.reactOnGround = true;                      // will flop, then rise
-    }
-}
-
-static void StepBallLive(float dt)
-{
-    const int N = 8;
-    for (int i = 0; i < N; i++) {
-        Vector3 prev = g.ball.pos;
-        BallStep(&g.ball, dt / N);
-        Vector3 p = g.ball.pos;
-
-        if (KeeperDeflect()) { Resolve(RES_SAVE); return; }
-
-        // crossing the goal-line plane — interpolate the exact crossing point
-        if (prev.z < GOAL_Z && p.z >= GOAL_Z) {
-            float t  = (GOAL_Z - prev.z) / (p.z - prev.z);
-            float xc = prev.x + (p.x - prev.x) * t;
-            float yc = prev.y + (p.y - prev.y) * t;
-            bool onPost = fabsf(fabsf(xc) - GOAL_HALF_W) < BALL_R + POST_R && yc > 0.0f && yc < GOAL_H + 0.15f;
-            bool onBar  = fabsf(yc - GOAL_H) < BALL_R + POST_R && fabsf(xc) < GOAL_HALF_W + 0.15f;
-
-            if (onPost || onBar) {                 // hit the woodwork: BOUNCE, don't verdict
-                Vector3 axisPt = onBar ? (Vector3){ p.x, GOAL_H, GOAL_Z }
-                                       : (Vector3){ (xc > 0 ? GOAL_HALF_W : -GOAL_HALF_W), p.y, GOAL_Z };
-                Vector3 nrm = Vector3Subtract(p, axisPt);
-                nrm = (Vector3Length(nrm) > 1e-4f) ? Vector3Normalize(nrm) : (Vector3){0, 0, -1};
-                g.ball.vel = Vector3Scale(Vector3Reflect(g.ball.vel, nrm), 0.6f);
-                g.ball.pos.z = GOAL_Z - BALL_R;    // back in play — its real path decides
-                g.hitWood = true;
-            } else {                               // clean pass through the plane
-                bool in = fabsf(xc) < GOAL_HALF_W && yc > 0.0f && yc < GOAL_H;
-                Resolve(in ? RES_GOAL : (g.hitWood ? RES_POST : RES_MISS));
-                return;
-            }
-        }
-
-        if (g.ball.pos.y <= BALL_R) {
-            g.ball.pos.y = BALL_R;
-            if (g.ball.vel.y < -1.6f) { g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.9f; g.ball.vel.z *= 0.9f; }
-            else { g.ball.vel.y = 0.0f; float roll = 1.0f - 0.35f*(dt/N); g.ball.vel.x *= roll; g.ball.vel.z *= roll; }
-        }
-    }
-    // came to rest without entering the goal
-    if (g.ball.pos.z < GOAL_Z - 0.3f && g.ball.pos.y <= BALL_R + 0.05f && Vector3Length(g.ball.vel) < 0.5f)
-        Resolve(g.hitWood ? RES_POST : RES_MISS);
-}
-
-static void StepBallSettle(float dt)
-{
-    if (g.caught) {   // ball is in the right glove — it rides the hand through the celebration
-        g.ball.pos = Vector3Lerp(g.ball.pos, g.kprGR, Clamp(9.0f * dt, 0.0f, 1.0f));
-        g.ball.vel = (Vector3){0};
-        return;
-    }
-    const int N = 6;
-    float backZ = GOAL_Z + NET_DEPTH;
-    for (int i = 0; i < N; i++) {
-        BallStep(&g.ball, dt / N);
-        // net catch ONLY when the ball is inside the goal frame (wide/high misses fly past)
-        if (g.ball.pos.z > GOAL_Z && fabsf(g.ball.pos.x) < GOAL_HALF_W && g.ball.pos.y < GOAL_H) {
-            g.ball.vel = Vector3Scale(g.ball.vel, 1.0f - 4.5f*(dt/N));   // net absorbs
-            if (g.ball.pos.z > backZ + 0.35f) { g.ball.pos.z = backZ + 0.35f; if (g.ball.vel.z > 0) g.ball.vel.z *= -0.12f; }
-            if (g.ball.pos.x >  GOAL_HALF_W - BALL_R) { g.ball.pos.x =  GOAL_HALF_W - BALL_R; g.ball.vel.x *= -0.2f; }
-            if (g.ball.pos.x < -GOAL_HALF_W + BALL_R) { g.ball.pos.x = -GOAL_HALF_W + BALL_R; g.ball.vel.x *= -0.2f; }
-            if (g.ball.pos.y >  GOAL_H - BALL_R)      { g.ball.pos.y =  GOAL_H - BALL_R;      g.ball.vel.y *= -0.2f; }
-        }
-        if (g.ball.pos.y <= BALL_R) {
-            g.ball.pos.y = BALL_R;
-            if (g.ball.vel.y < -1.6f) { g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.9f; g.ball.vel.z *= 0.9f; }
-            else { g.ball.vel.y = 0.0f; float roll = 1.0f - 0.9f*(dt/N); g.ball.vel.x *= roll; g.ball.vel.z *= roll; }
-        }
-    }
-}
-
-// ---- crowd --------------------------------------------------------------
-static Color CrowdColor(int h)
-{
-    static const Color pal[5] = {
-        {200,70,70,255}, {238,238,238,255}, {70,110,200,255}, {235,200,60,255}, {80,180,110,255}
-    };
-    return pal[h % 5];
-}
-
-static void DrawCrowd(void)
-{
-    float t = GetTime();
-    bool cel = g.celebrate > 0.0f;
-    for (int row = 0; row < 5; row++)
-        for (int col = 0; col < 44; col++) {
-            int h = (row*31 + col*17) % 100;
-            float x = -13.0f + col * (26.0f / 43.0f);
-            float z = GOAL_Z + 3.0f + row * 0.95f;
-            float y = 0.7f + row * 0.75f;
-            float jump = cel ? fabsf(sinf(t*12.0f + h)) * 0.35f : 0.0f;
-            DrawCube((Vector3){ x, y + jump, z }, 0.28f, 0.42f, 0.28f, CrowdColor(h));
-        }
-}
-
-// ---- pitch markings -----------------------------------------------------
-static void PitchLineH(float z, float x0, float x1)
-{ DrawCube((Vector3){(x0+x1)*0.5f, 0.02f, z}, fabsf(x1-x0), 0.03f, 0.12f, (Color){235,238,240,200}); }
-static void PitchLineV(float x, float z0, float z1)
-{ DrawCube((Vector3){x, 0.02f, (z0+z1)*0.5f}, 0.12f, 0.03f, fabsf(z1-z0), (Color){235,238,240,200}); }
-
-static void DrawPitch(void)
-{
-    const float PW = 20.15f, GW = 9.16f;
-    PitchLineH(GOAL_Z, -PW, PW);            // goal line
-    PitchLineH(-5.5f,  -PW, PW);            // penalty area front (16.5m)
-    PitchLineV(-PW, -5.5f, GOAL_Z);
-    PitchLineV( PW, -5.5f, GOAL_Z);
-    PitchLineH(5.5f, -GW, GW);              // goal area / 6-yard box front (5.5m)
-    PitchLineV(-GW, 5.5f, GOAL_Z);
-    PitchLineV( GW, 5.5f, GOAL_Z);
-    DrawCube((Vector3){0, 0.02f, 0}, 0.22f, 0.03f, 0.22f, (Color){235,238,240,220}); // penalty spot
 }
 
 // ---- ragdoll smoothing --------------------------------------------------
@@ -399,75 +216,82 @@ static void Spring(Vector3 *pos, Vector3 *vel, Vector3 target, float dt, float k
 static void UpdateGloves(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR)
 {
     g.kprAxis = Vector3Normalize(Vector3Lerp(g.kprAxis, tAxis, Clamp(13.0f*dt, 0.0f, 1.0f)));
-    Spring(&g.kprGL, &g.kprGLv, tGL, dt, 130.0f, 15.0f);   // under-damped = springy, ragdolly arms
+    Spring(&g.kprGL, &g.kprGLv, tGL, dt, 130.0f, 15.0f);
     Spring(&g.kprGR, &g.kprGRv, tGR, dt, 130.0f, 15.0f);
 }
 
-// ---- keeper reactions (celebration / frustration) -----------------------
+// ---- keeper reactions ---------------------------------------------------
 static void ComputeReactionPose(float t, float dt)
 {
     const float standY = 1.05f, groundY = 0.42f;
     g.kprHeadOff = (Vector3){0};
 
+    // dive plays out on the ground before rising (longer for a beaten keeper)
+    float onDur = g.reactCelebrate ? 0.6f : 0.95f, riseDur = 0.6f;
     float up;
-    if (!g.reactOnGround)   up = 1.0f;
-    else if (t < 0.5f)      up = 0.0f;                  // on the ground
-    else if (t < 1.0f)      up = (t - 0.5f) / 0.5f;     // getting up
-    else                    up = 1.0f;                  // standing
-    up = up*up*(3.0f - 2.0f*up);                        // smoothstep
+    if (!g.reactOnGround) up = 1.0f;
+    else if (t < onDur)            up = 0.0f;
+    else if (t < onDur + riseDur)  up = (t - onDur) / riseDur;
+    else                           up = 1.0f;
+    up = up*up*(3.0f - 2.0f*up);
 
     Vector3 diveDir = { (g.reactBase.x >= 0 ? 1.0f : -1.0f), 0.0f, 0.0f };
     Vector3 center  = { g.reactBase.x, Lerp(groundY - 0.05f, standY, up), g.reactBase.z };
     Vector3 axis    = Vector3Normalize(Vector3Lerp(diveDir, (Vector3){0,1,0}, up));
     Vector3 gl = { -0.4f, 0.15f, 0.0f }, gr = { 0.4f, 0.15f, 0.0f };
 
-    float lt = fmaxf(0.0f, t - (g.reactOnGround ? 1.0f : 0.0f));   // time spent standing
+    float lt = fmaxf(0.0f, t - (g.reactOnGround ? (onDur + riseDur) : 0.0f));
     float w  = lt * 6.0f;
+    float gw = t * 7.0f;   // on-ground motion clock
 
-    if (g.reactCelebrate && g.reactHeld) {
-        switch (g.reactAnim) {   // ball rides the RIGHT glove (gr) unless dropped
-        case 0: gr = (Vector3){0.3f,0.75f,0.0f};
-                gl.y = 0.15f + fabsf(sinf(w))*0.5f; center.y += fabsf(sinf(w))*0.05f*up; break;    // hold it aloft
-        case 1: gr = (Vector3){0.25f,0.28f,-0.05f}; gl = (Vector3){-0.25f, 0.28f + sinf(w)*0.1f, -0.05f};
-                center.y += fabsf(sinf(w*1.2f))*0.08f*up; break;                                   // clutch & pat, hops
+    bool onFloor = g.reactOnGround && up < 0.35f;
+
+    if (onFloor) {
+        if (g.reactCelebrate) {                                  // celebrate lying down
+            gl = (Vector3){-0.35f, 0.1f + fabsf(sinf(gw))*0.3f, 0.25f};
+            gr = (Vector3){ 0.35f, 0.1f + fabsf(sinf(gw+1.5f))*0.3f, 0.25f};
+        } else {                                                 // frustration on the ground
+            switch (g.reactAnim % 3) {
+            case 0: gl = (Vector3){-0.3f, -0.05f - fabsf(sinf(gw*1.6f))*0.15f, 0.4f};   // slam both fists
+                    gr = (Vector3){ 0.3f, -0.05f - fabsf(sinf(gw*1.6f))*0.15f, 0.4f}; break;
+            case 1: gl = (Vector3){-0.55f, 0.0f, -0.1f};  gr = (Vector3){0.55f, 0.0f, -0.1f}; break;   // arms spread, flat out
+            case 2: gl = (Vector3){-0.14f, 0.12f, 0.28f}; gr = (Vector3){0.14f, 0.12f, 0.28f};         // face in hands
+                    g.kprHeadOff = (Vector3){ sinf(gw*0.7f)*0.05f, 0, 0 }; break;
+            }
+        }
+    } else if (g.reactCelebrate && g.reactHeld) {
+        switch (g.reactAnim) {   // ball rides the RIGHT glove unless dropped
+        case 0: gr = (Vector3){0.3f,0.75f,0.0f}; gl.y = 0.15f + fabsf(sinf(w))*0.5f; center.y += fabsf(sinf(w))*0.05f*up; break;
+        case 1: gr = (Vector3){0.25f,0.28f,-0.05f}; gl = (Vector3){-0.25f, 0.28f + sinf(w)*0.1f, -0.05f}; center.y += fabsf(sinf(w*1.2f))*0.08f*up; break;
         case 2: if (g.caught) { gr = (Vector3){0.3f,0.05f,0.0f}; gl = (Vector3){-0.35f,0.15f,0.0f}; }
-                else { gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f; } break; // drop -> pump
-        case 3: gr = (Vector3){0.15f,0.55f,0.15f}; gl = (Vector3){-0.35f,0.05f,0.0f}; break;       // kiss the ball
+                else { gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f; } break;
+        case 3: gr = (Vector3){0.15f,0.55f,0.15f}; gl = (Vector3){-0.35f,0.05f,0.0f}; break;
         case 4: if (g.caught) { gr = (Vector3){0.3f,0.6f,0.0f}; gl = (Vector3){-0.3f,0.4f,0.0f}; }
-                else { gl = (Vector3){-0.6f,0.35f,0.0f}; gr = (Vector3){0.6f,0.35f,0.0f}; } break;  // spike -> arms out
+                else { gl = (Vector3){-0.6f,0.35f,0.0f}; gr = (Vector3){0.6f,0.35f,0.0f}; } break;
         }
     } else if (g.reactCelebrate) {
         switch (g.reactAnim) {
-        case 0: gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f;
-                center.y += fabsf(sinf(w))*0.05f*up; break;                                    // fist pumps
-        case 1: gl = (Vector3){-0.7f,0.4f,0.0f}; gr = (Vector3){0.7f,0.4f,0.0f};
-                center.x += sinf(w*0.5f)*0.15f*up;
-                axis = Vector3Normalize((Vector3){ sinf(w*0.5f)*0.22f, 1.0f, 0.0f }); break;   // arms wide, sway
-        case 2: center.y += fabsf(sinf(w*0.7f))*0.4f*up;
-                gl = (Vector3){-0.3f,0.7f,0.0f}; gr = (Vector3){0.3f,0.7f,0.0f}; break;         // jump, arms up
-        case 3: gr = (Vector3){0.22f,0.78f,0.1f}; gl = (Vector3){-0.35f,0.0f,0.0f};
-                center.y += fabsf(sinf(w*0.8f))*0.08f*up; break;                               // point to sky
-        case 4: gl = (Vector3){-0.34f,0.46f,0.12f}; gr = (Vector3){0.34f,0.46f,0.12f};
-                center.y += fabsf(sinf(w))*0.06f*up; break;                                    // bicep flex
+        case 0: gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f; center.y += fabsf(sinf(w))*0.05f*up; break;
+        case 1: gl = (Vector3){-0.7f,0.4f,0.0f}; gr = (Vector3){0.7f,0.4f,0.0f}; center.x += sinf(w*0.5f)*0.15f*up;
+                axis = Vector3Normalize((Vector3){ sinf(w*0.5f)*0.22f, 1.0f, 0.0f }); break;
+        case 2: center.y += fabsf(sinf(w*0.7f))*0.4f*up; gl = (Vector3){-0.3f,0.7f,0.0f}; gr = (Vector3){0.3f,0.7f,0.0f}; break;
+        case 3: gr = (Vector3){0.22f,0.78f,0.1f}; gl = (Vector3){-0.35f,0.0f,0.0f}; center.y += fabsf(sinf(w*0.8f))*0.08f*up; break;
+        case 4: gl = (Vector3){-0.34f,0.46f,0.12f}; gr = (Vector3){0.34f,0.46f,0.12f}; center.y += fabsf(sinf(w))*0.06f*up; break;
         }
-    } else {
+    } else {   // standing frustration
         switch (g.reactAnim) {
-        case 0: if (up < 0.5f) { gl = (Vector3){-0.3f,-0.25f,0.3f}; gr = (Vector3){0.3f,-0.25f,0.3f}; }
-                else           { gl = (Vector3){-0.3f,0.5f,0.1f};  gr = (Vector3){0.3f,0.5f,0.1f}; } break; // ground slam -> anguish
+        case 0: gl = (Vector3){-0.3f,0.5f,0.1f}; gr = (Vector3){0.3f,0.5f,0.1f}; break;
         case 1: gl = (Vector3){-0.16f,0.6f,0.16f}; gr = (Vector3){0.16f,0.6f,0.16f};
-                axis = Vector3Normalize(Vector3Lerp(axis, (Vector3){0,1,-0.4f}, up)); break;   // head in hands, slump
-        case 2: center.x += sinf(w*1.6f)*0.08f*up; gr.y = 0.1f + fabsf(sinf(w))*0.25f; break;  // stomp / kick
-        case 3: gl = (Vector3){-0.32f,0.05f,0.0f}; gr = (Vector3){0.32f,0.05f,0.0f};
-                g.kprHeadOff = (Vector3){ sinf(w)*0.12f, 0.0f, 0.0f }; break;                   // hands on hips, shake head
-        case 4: gl = (Vector3){-0.45f,-0.2f,0.0f}; gr = (Vector3){0.45f,-0.2f,0.0f};
-                center.x += sinf(w*0.35f)*0.12f*up; break;                                      // fling arms, turn away
+                axis = Vector3Normalize(Vector3Lerp(axis, (Vector3){0,1,-0.4f}, up)); break;
+        case 2: center.x += sinf(w*1.6f)*0.08f*up; gr.y = 0.1f + fabsf(sinf(w))*0.25f; break;
+        case 3: gl = (Vector3){-0.32f,0.05f,0.0f}; gr = (Vector3){0.32f,0.05f,0.0f}; g.kprHeadOff = (Vector3){ sinf(w)*0.12f, 0.0f, 0.0f }; break;
+        case 4: gl = (Vector3){-0.45f,-0.2f,0.0f}; gr = (Vector3){0.45f,-0.2f,0.0f}; center.x += sinf(w*0.35f)*0.12f*up; break;
         }
     }
 
-    g.kprPos = Vector3Lerp(g.kprPos, center, Clamp(14.0f*dt, 0.0f, 1.0f));   // ease body, don't snap
+    g.kprPos = Vector3Lerp(g.kprPos, center, Clamp(14.0f*dt, 0.0f, 1.0f));
     UpdateGloves(dt, axis, Vector3Add(center, gl), Vector3Add(center, gr));
 }
-
 static void KeeperReact(float dt)
 {
     if (!g.landed) {                          // let the dive finish — fall to the turf
@@ -480,26 +304,181 @@ static void KeeperReact(float dt)
     } else {
         g.reactT += dt;
         ComputeReactionPose(g.reactT, dt);
-        if (g.reactHeld && g.caught &&                        // some catch celebrations drop the ball
-            ((g.reactAnim == 2 && g.reactT > 0.9f) || (g.reactAnim == 4 && g.reactT > 0.7f))) {
+        if (g.reactHeld && g.caught &&
+            ((g.reactAnim == 2 && g.reactT > 1.2f) || (g.reactAnim == 4 && g.reactT > 1.0f))) {
             g.caught = false;
-            if (g.reactAnim == 4) g.ball.vel = (Vector3){ 0.0f, -1.5f, -2.5f };   // spike it down/out
+            if (g.reactAnim == 4) g.ball.vel = (Vector3){ 0.0f, -1.5f, -2.5f };
         }
     }
 }
 
-// ---- touch / swipe input ------------------------------------------------
-// direction aims (left/right + height), length = power, arc of the swipe = curl.
-static void SwipeToAim(Vector2 start, Vector2 cur, float bend)
+// ---- flow ---------------------------------------------------------------
+static void StartKick(void)
+{
+    g.phase = PHASE_AIM;
+    g.yaw = 0.0f; g.pitch = 0.16f; g.curve = 0.0f; g.power01 = 0.0f; g.chargeDir = 1.0f;
+    g.ball = (Ball){0}; g.ball.pos = (Vector3){0.0f, BALL_R, 0.0f};
+    ResetKeeper(); InitNet();
+    g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
+    g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
+}
+static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
+
+static Strike AimStrike(void)
+{
+    float scatter = g.power01 * 0.05f;
+    return (Strike){ .power = 13.0f + g.power01 * 16.0f,
+                     .yaw = g.yaw + Frand2()*scatter, .pitch = g.pitch + Frand2()*scatter*0.6f,
+                     .curve = g.curve * 3.0f };
+}
+static void CommitKeeperDive(void)
+{
+    Ball p = g.ball;
+    for (int i = 0; i < 500 && p.pos.z < GOAL_Z; i++) BallStep(&p, 0.01f);
+    float px = p.pos.x, py = p.pos.y;
+    float err = Frand2() * 1.9f;
+    if (Frand() < 0.18f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;
+    g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
+    g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
+    g.kprReact = 0.16f + Frand() * 0.12f; g.kprLaunched = false; g.kprVel = (Vector3){0};
+}
+static void Resolve(Result r)
+{
+    g.result = r; g.resolved = true; g.resultTimer = 0.0f;
+    if (r == RES_GOAL) { g.scored++; g.celebrate = 1.7f; }
+    g.reactAnim = GetRandomValue(0, 4);
+    g.reactCelebrate = (r != RES_GOAL);
+    g.reactHeld = (r == RES_SAVE && g.caught);
+    g.reactT = 0.0f; g.kprHeadOff = (Vector3){0};
+    if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
+        g.landed = true;  g.reactOnGround = false; g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z };
+    } else { g.landed = false; g.reactOnGround = true; }
+}
+
+// turf: bounce if descending fast, else roll — and KILL spin so it can't spiral
+static void Ground(float dt, int N)
+{
+    if (g.ball.pos.y > BALL_R) return;
+    g.ball.pos.y = BALL_R;
+    if (g.ball.vel.y < -1.6f) { g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.9f; g.ball.vel.z *= 0.9f; }
+    else {
+        g.ball.vel.y = 0.0f;
+        float roll = 1.0f - 1.4f * (dt / N);                   // real rolling friction
+        g.ball.vel.x *= roll; g.ball.vel.z *= roll;
+        g.ball.spin = (Vector3){0};                            // grounded ball doesn't Magnus-curl
+        if (Vector3Length(g.ball.vel) < 0.35f) g.ball.vel = (Vector3){0};
+    }
+}
+static void Bounds(void)   // stadium walls so nothing sails into the fans
+{
+    if (g.ball.pos.z > BACK_WALL)  { g.ball.pos.z = BACK_WALL; g.ball.vel.z *= -0.3f; g.ball.vel.x *= 0.7f; }
+    if (fabsf(g.ball.pos.x) > 16.0f) { g.ball.pos.x = (g.ball.pos.x>0?16.0f:-16.0f); g.ball.vel.x *= -0.3f; }
+}
+
+static void StepBallLive(float dt)
+{
+    const int N = 8;
+    for (int i = 0; i < N; i++) {
+        Vector3 prev = g.ball.pos;
+        BallStep(&g.ball, dt / N);
+        Vector3 p = g.ball.pos;
+        if (KeeperDeflect()) { Resolve(RES_SAVE); return; }
+        if (prev.z < GOAL_Z && p.z >= GOAL_Z) {
+            float t  = (GOAL_Z - prev.z) / (p.z - prev.z);
+            float xc = prev.x + (p.x - prev.x) * t, yc = prev.y + (p.y - prev.y) * t;
+            bool onPost = fabsf(fabsf(xc) - GOAL_HALF_W) < BALL_R + POST_R && yc > 0.0f && yc < GOAL_H + 0.15f;
+            bool onBar  = fabsf(yc - GOAL_H) < BALL_R + POST_R && fabsf(xc) < GOAL_HALF_W + 0.15f;
+            if (onPost || onBar) {
+                Vector3 axisPt = onBar ? (Vector3){ p.x, GOAL_H, GOAL_Z }
+                                       : (Vector3){ (xc > 0 ? GOAL_HALF_W : -GOAL_HALF_W), p.y, GOAL_Z };
+                Vector3 nrm = Vector3Subtract(p, axisPt);
+                nrm = (Vector3Length(nrm) > 1e-4f) ? Vector3Normalize(nrm) : (Vector3){0,0,-1};
+                g.ball.vel = Vector3Scale(Vector3Reflect(g.ball.vel, nrm), 0.6f);
+                g.ball.pos.z = GOAL_Z - BALL_R; g.hitWood = true;
+            } else {
+                bool in = fabsf(xc) < GOAL_HALF_W && yc > 0.0f && yc < GOAL_H;
+                Resolve(in ? RES_GOAL : (g.hitWood ? RES_POST : RES_MISS)); return;
+            }
+        }
+        Ground(dt, N);
+    }
+    if (g.ball.pos.z < GOAL_Z - 0.3f && g.ball.pos.y <= BALL_R + 0.05f && Vector3Length(g.ball.vel) < 0.4f)
+        Resolve(g.hitWood ? RES_POST : RES_MISS);
+}
+static void StepBallSettle(float dt)
+{
+    if (g.caught) {
+        g.ball.pos = Vector3Lerp(g.ball.pos, g.kprGR, Clamp(9.0f * dt, 0.0f, 1.0f));
+        g.ball.vel = (Vector3){0};
+        return;
+    }
+    const int N = 6;
+    float backZ = GOAL_Z + NET_DEPTH;
+    for (int i = 0; i < N; i++) {
+        BallStep(&g.ball, dt / N);
+        if (g.ball.pos.z > GOAL_Z && fabsf(g.ball.pos.x) < GOAL_HALF_W && g.ball.pos.y < GOAL_H) {
+            g.ball.vel = Vector3Scale(g.ball.vel, 1.0f - 4.5f*(dt/N));
+            if (g.ball.pos.z > backZ + 0.35f) { g.ball.pos.z = backZ + 0.35f; if (g.ball.vel.z > 0) g.ball.vel.z *= -0.12f; }
+            if (g.ball.pos.x >  GOAL_HALF_W - BALL_R) { g.ball.pos.x =  GOAL_HALF_W - BALL_R; g.ball.vel.x *= -0.2f; }
+            if (g.ball.pos.x < -GOAL_HALF_W + BALL_R) { g.ball.pos.x = -GOAL_HALF_W + BALL_R; g.ball.vel.x *= -0.2f; }
+            if (g.ball.pos.y >  GOAL_H - BALL_R)      { g.ball.pos.y =  GOAL_H - BALL_R;      g.ball.vel.y *= -0.2f; }
+        }
+        Ground(dt, N);
+        Bounds();
+    }
+}
+
+// ---- stadium (bleachers + fans) -----------------------------------------
+static Color CrowdColor(int h)
+{
+    static const Color pal[5] = { {200,70,70,255},{238,238,238,255},{70,110,200,255},{235,200,60,255},{80,180,110,255} };
+    return pal[h % 5];
+}
+static void DrawStadium(void)
+{
+    float t = GetTime();
+    bool cel = g.celebrate > 0.0f;
+    const int ROWS = 7, COLS = 54;
+    for (int r = 0; r < ROWS; r++) {
+        float z = GOAL_Z + 2.7f + r*1.15f;
+        float y = 0.2f + r*0.8f;
+        DrawCube((Vector3){0, y - 0.5f, z}, 36.0f, 1.0f, 1.15f, (Color){ 58,60,70,255 });      // concrete tier
+        DrawCube((Vector3){0, y - 0.02f, z - 0.5f}, 36.0f, 0.09f, 0.12f, (Color){ 40,42,50,255 }); // step nose
+        for (int c = 0; c < COLS; c++) {
+            int h = (r*37 + c*19) % 100;
+            float x = -17.0f + c*(34.0f/(COLS-1));
+            float jump = cel ? fabsf(sinf(t*12.0f + h))*0.32f : fabsf(sinf(t*1.1f + h))*0.03f;
+            DrawCube((Vector3){x, y + 0.35f + jump, z}, 0.26f, 0.4f, 0.26f, CrowdColor(h));
+        }
+    }
+}
+
+// ---- pitch markings -----------------------------------------------------
+static void PitchLineH(float z, float x0, float x1)
+{ DrawCube((Vector3){(x0+x1)*0.5f, 0.02f, z}, fabsf(x1-x0), 0.03f, 0.12f, (Color){235,238,240,200}); }
+static void PitchLineV(float x, float z0, float z1)
+{ DrawCube((Vector3){x, 0.02f, (z0+z1)*0.5f}, 0.12f, 0.03f, fabsf(z1-z0), (Color){235,238,240,200}); }
+static void DrawPitch(void)
+{
+    const float PW = 20.15f, GW = 9.16f;
+    PitchLineH(GOAL_Z, -PW, PW);
+    PitchLineH(-5.5f,  -PW, PW); PitchLineV(-PW, -5.5f, GOAL_Z); PitchLineV(PW, -5.5f, GOAL_Z);
+    PitchLineH(5.5f, -GW, GW);   PitchLineV(-GW, 5.5f, GOAL_Z);  PitchLineV(GW, 5.5f, GOAL_Z);
+    DrawCube((Vector3){0, 0.02f, 0}, 0.22f, 0.03f, 0.22f, (Color){235,238,240,220});
+}
+
+// ---- input --------------------------------------------------------------
+static void AimFromPress(Vector2 m)   // X-Y position selects the trajectory
 {
     float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
-    float dx = cur.x - start.x, ddy = cur.y - start.y;
-    float len = sqrtf(dx*dx + ddy*ddy);
-    float up = (len > 1.0f) ? (-ddy / len) : 1.0f;          // 1 = swiped straight up the screen
-    g.yaw     = Clamp(dx / (W*0.30f) * 0.42f, -0.42f, 0.42f);
-    g.power01 = Clamp(len / (H*0.55f), 0.15f, 1.0f);
-    g.pitch   = Clamp(0.08f + up*0.30f, 0.04f, 0.52f);
-    g.curve   = Clamp(-bend * 0.9f, -1.0f, 1.0f);
+    g.yaw   = Clamp((m.x/W - 0.5f) * 2.0f * 0.42f, -0.42f, 0.42f);
+    g.pitch = Clamp(0.05f + (1.0f - m.y/H) * 0.5f, 0.04f, 0.52f);
+}
+static void FireShot(void)
+{
+    g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
+    CommitKeeperDive();
+    g.phase = PHASE_FLY;
 }
 
 // ---- main frame ---------------------------------------------------------
@@ -508,58 +487,37 @@ static void UpdateDrawFrame(void)
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
     if (g.celebrate > 0.0f) g.celebrate -= dt;
+    if (g.scrambleCd > 0.0f) g.scrambleCd -= dt;
+    Vector2 m = GetMousePosition();
 
     switch (g.phase) {
     case PHASE_AIM: {
-        float s = 0.9f * dt;
+        float s = 0.9f * dt;                                    // keyboard aim (desktop)
         if (IsKeyDown(KEY_LEFT))  g.yaw   -= s;
         if (IsKeyDown(KEY_RIGHT)) g.yaw   += s;
         if (IsKeyDown(KEY_UP))    g.pitch += s;
         if (IsKeyDown(KEY_DOWN))  g.pitch -= s;
-        g.yaw = Clamp(g.yaw, -0.42f, 0.42f);
-        g.pitch = Clamp(g.pitch, 0.02f, 0.55f);
+        g.yaw = Clamp(g.yaw, -0.42f, 0.42f); g.pitch = Clamp(g.pitch, 0.02f, 0.55f);
         if (IsKeyDown(KEY_A)) g.curve = Clamp(g.curve - 1.4f*dt, -1.0f, 1.0f);
         if (IsKeyDown(KEY_D)) g.curve = Clamp(g.curve + 1.4f*dt, -1.0f, 1.0f);
-
-        // touch / mouse: swipe to shoot
-        Vector2 m = GetMousePosition();
+        // touch/mouse: press position sets trajectory, then hold to charge
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            g.swipeActive = true; g.swipeStart = m; g.swipePrev = m;
-            g.swipeDir = (Vector2){0,0}; g.swipeBend = 0.0f;
+            AimFromPress(m); g.pressX = m.x; g.curve = 0.0f;
+            g.touchCharge = true; g.power01 = 0.0f; g.chargeDir = 1.0f; g.phase = PHASE_CHARGE;
         }
-        if (g.swipeActive && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            Vector2 d = { m.x - g.swipePrev.x, m.y - g.swipePrev.y };
-            float dl = sqrtf(d.x*d.x + d.y*d.y);
-            if (dl > 6.0f) {                                    // accumulate the swipe's bend (for curl)
-                Vector2 nd = { d.x/dl, d.y/dl };
-                if (g.swipeDir.x != 0.0f || g.swipeDir.y != 0.0f)
-                    g.swipeBend += g.swipeDir.x*nd.y - g.swipeDir.y*nd.x;
-                g.swipeDir = nd; g.swipePrev = m;
-            }
-            SwipeToAim(g.swipeStart, m, g.swipeBend);           // live preview (red arc follows)
-        }
-        if (g.swipeActive && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            g.swipeActive = false;
-            Vector2 v = { m.x - g.swipeStart.x, m.y - g.swipeStart.y };
-            if (sqrtf(v.x*v.x + v.y*v.y) > 40.0f) {             // a real swipe -> strike
-                SwipeToAim(g.swipeStart, m, g.swipeBend);
-                g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
-                CommitKeeperDive();
-                g.phase = PHASE_FLY;
-            }
-        }
-
-        if (IsKeyPressed(KEY_SPACE)) { g.phase = PHASE_CHARGE; g.power01 = 0.0f; g.chargeDir = 1.0f; }
+        if (IsKeyPressed(KEY_SPACE)) { g.touchCharge = false; g.power01 = 0.0f; g.chargeDir = 1.0f; g.phase = PHASE_CHARGE; }
     } break;
 
     case PHASE_CHARGE: {
-        g.power01 += g.chargeDir * 1.6f * dt;
+        g.power01 += g.chargeDir * 1.6f * dt;                   // hold charges & uncharges
         if (g.power01 >= 1.0f) { g.power01 = 1.0f; g.chargeDir = -1.0f; }
         if (g.power01 <= 0.0f) { g.power01 = 0.0f; g.chargeDir =  1.0f; }
-        if (IsKeyReleased(KEY_SPACE) || IsKeyPressed(KEY_SPACE)) {
-            g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
-            CommitKeeperDive();
-            g.phase = PHASE_FLY;
+        if (g.touchCharge) {
+            float W = (float)GetScreenWidth();
+            g.curve = Clamp((m.x - g.pressX) / (W * 0.14f), -1.0f, 1.0f);   // drag = spin
+            if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) FireShot();
+        } else {
+            if (IsKeyReleased(KEY_SPACE) || IsKeyPressed(KEY_SPACE)) FireShot();
         }
     } break;
 
@@ -567,46 +525,41 @@ static void UpdateDrawFrame(void)
         StepNet(dt);
         if (!g.resolved) {
             StepKeeper(dt);
+            TryScramble();                     // late lunge for a loose/slow ball
             { float sp = Vector3Length(g.kprVel);
               Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
               UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1)); }
             StepBallLive(dt);
             g.flight += dt;
-            if (!g.resolved && g.flight > 4.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
+            if (!g.resolved && g.flight > 5.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
         } else {
-            KeeperReact(dt);
-            StepBallSettle(dt);
-            g.resultTimer += dt;
+            KeeperReact(dt); StepBallSettle(dt); g.resultTimer += dt;
             if (g.landed && g.reactT > REACT_DUR) {
                 g.kick++;
-                if (g.kick >= KICKS_TOTAL) g.phase = PHASE_RESULT;
-                else StartKick();
+                if (g.kick >= KICKS_TOTAL) g.phase = PHASE_RESULT; else StartKick();
             }
         }
     } break;
 
     case PHASE_RESULT:
-        StepNet(dt);
-        KeeperReact(dt);
+        StepNet(dt); KeeperReact(dt);
         if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ResetMatch();
         break;
     }
 
     // ---- draw ----
+    int W = GetScreenWidth(), H = GetScreenHeight();
     BeginDrawing();
     ClearBackground((Color){ 20, 24, 32, 255 });
-
     BeginMode3D(g.cam);
-        DrawCrowd();
+        DrawStadium();
         DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
         DrawPitch();
-
         DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
         DrawCube((Vector3){ GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
-
-        {   // keeper — pose is sprung/eased every frame (ragdoll feel), no snapping
+        {   // keeper — sprung pose (ragdoll feel)
             Vector3 axis = g.kprAxis;
             Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), g.kprHeadOff);
             Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
@@ -618,52 +571,43 @@ static void UpdateDrawFrame(void)
             DrawSphere(g.kprGR, GLOVE_R, (Color){ 40, 210, 235, 255 });
         }
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
-
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
             Strike s = { .power = 13.0f + g.power01*16.0f, .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve*3.0f };
-            Ball t = BallLaunch((Vector3){0, BALL_R, 0}, s);
-            Vector3 prev = t.pos;
-            for (int i = 0; i < 60 && t.pos.z < GOAL_Z + 1; i++) {
-                BallStep(&t, 0.03f);
-                DrawLine3D(prev, t.pos, (Color){ 255, 90, 90, 150 });
-                prev = t.pos;
-            }
+            Ball tb = BallLaunch((Vector3){0, BALL_R, 0}, s);
+            Vector3 prev = tb.pos;
+            for (int i = 0; i < 60 && tb.pos.z < GOAL_Z + 1; i++) { BallStep(&tb, 0.03f); DrawLine3D(prev, tb.pos, (Color){255,90,90,150}); prev = tb.pos; }
         }
     EndMode3D();
 
     // ---- HUD ----
     DrawText("WORLD CUP PENALTY", 20, 16, 28, RAYWHITE);
-    DrawText(TextFormat("Kick %d / %d     Scored %d",
-             (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
+    DrawText(TextFormat("Kick %d / %d     Scored %d", (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
              20, 50, 20, (Color){ 200, 210, 220, 255 });
-
     if (g.phase == PHASE_AIM)
-        DrawText("Swipe to shoot  —  aim by direction, arc it to curl   (or arrows + SPACE)",
-                 20, GetScreenHeight()-34, 18, RAYWHITE);
+        DrawText("Touch to aim, hold to charge power, drag to curl  (or arrows + SPACE)", 20, H-34, 18, RAYWHITE);
     if (g.phase == PHASE_CHARGE) {
-        DrawText("Release SPACE to strike   (more power = less accurate)", 20, GetScreenHeight()-34, 18, RAYWHITE);
-        DrawRectangle(20, GetScreenHeight()-70, 300, 22, (Color){0,0,0,120});
-        DrawRectangle(20, GetScreenHeight()-70, (int)(300*g.power01), 22, (Color){ 90, 200, 120, 255 });
+        DrawText("Release to strike   ·   drag left/right to curl", 20, H-34, 18, RAYWHITE);
+        DrawRectangle(20, H-70, 300, 22, (Color){0,0,0,120});
+        DrawRectangle(20, H-70, (int)(300*g.power01), 22, (Color){ 90, 200, 120, 255 });
     }
     if (g.phase == PHASE_FLY && g.resolved) {
-        const char *msg = g.result==RES_GOAL ? "GOAL!" : g.result==RES_SAVE ? "SAVED!" :
-                          g.result==RES_POST ? "OFF THE WOODWORK!" : "MISS!";
+        const char *msg = g.result==RES_GOAL ? "GOAL!" : g.result==RES_SAVE ? "SAVED!" : g.result==RES_POST ? "OFF THE WOODWORK!" : "MISS!";
         Color c = g.result==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255};
-        int fs = 56; int w = MeasureText(msg, fs);
-        DrawText(msg, GetScreenWidth()/2 - w/2, 92, fs, c);
+        int fs = 56, tw = MeasureText(msg, fs);
+        DrawText(msg, W/2 - tw/2, 92, fs, c);
     }
     if (g.phase == PHASE_RESULT) {
-        const char *m = TextFormat("FULL TIME   Scored %d / %d", g.scored, KICKS_TOTAL);
-        int w = MeasureText(m, 40);
-        DrawText(m, GetScreenWidth()/2 - w/2, 96, 40, RAYWHITE);
-        DrawText("ENTER to play again", GetScreenWidth()/2 - 110, 160, 20, (Color){200,210,220,255});
+        const char *mm = TextFormat("FULL TIME   Scored %d / %d", g.scored, KICKS_TOTAL);
+        int tw = MeasureText(mm, 40);
+        DrawText(mm, W/2 - tw/2, 96, 40, RAYWHITE);
+        DrawText("Tap / ENTER to play again", W/2 - 130, 160, 20, (Color){200,210,220,255});
     }
-
     EndDrawing();
 }
 
 int main(void)
 {
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(900, 600, "Arcade - World Cup Penalty");
 
     g.cam = (Camera3D){0};
@@ -681,7 +625,6 @@ int main(void)
     SetTargetFPS(60);
     while (!WindowShouldClose()) UpdateDrawFrame();
 #endif
-
     CloseWindow();
     return 0;
 }

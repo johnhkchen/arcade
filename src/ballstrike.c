@@ -32,6 +32,8 @@ void BallStep(Ball *b, float dt)
     // Magnus: a ~ spin x vel
     Vector3 magnus = Vector3CrossProduct(b->spin, b->vel);
     b->vel = Vector3Add(b->vel, Vector3Scale(magnus, BS_MAGNUS * dt));
+    // spin bleeds off so curl doesn't drive an endless spiral
+    b->spin = Vector3Scale(b->spin, 1.0f - fminf(0.6f * dt, 1.0f));
     // integrate position
     b->pos = Vector3Add(b->pos, Vector3Scale(b->vel, dt));
 }
