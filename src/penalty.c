@@ -243,7 +243,14 @@ static Color Mix(Color a, Color b, float t)
 // a shadowed wordmark. Baked at 2x and downsampled so the pixel font reads clean.
 static Texture2D BakeBanner(Sponsor s)
 {
-    const int S = 2, W = 512*S, H = 128*S;
+    const int S = 2, H = 128*S;
+    Font f = GetFontDefault();
+    int pad = 17*S, ts = H - 2*pad, tx = pad + ts + 20*S;          // logo tile then wordmark
+    float nfs = 46*S, nsp = 3*S;
+    Vector2 nz = MeasureTextEx(f, s.name, nfs, nsp);
+    Vector2 tz = s.tag ? MeasureTextEx(f, s.tag, 20*S, 1*S) : (Vector2){0,0};
+    const int W = tx + (int)fmaxf(nz.x, tz.x) + 24*S;              // size the board to fit its own text
+
     unsigned char *px = (unsigned char *)malloc((size_t)W*H*4);
     Color hi = Mix(s.bg, (Color){255,255,255,255}, 0.16f), lo = Mix(s.bg, (Color){0,0,0,255}, 0.34f);
     for (int y = 0; y < H; y++) {                                   // vertical gloss: sheen up top, shadow below
@@ -255,24 +262,20 @@ static Texture2D BakeBanner(Sponsor s)
     ImageDrawRectangle(&im, 0, 0, W, 5*S, s.accent);               // top / bottom accent rails
     ImageDrawRectangle(&im, 0, H-5*S, W, 5*S, s.accent);
 
-    int pad = 17*S, ts = H - 2*pad;                                // logo tile (rounded-clay feel via a bevel)
-    ImageDrawRectangle(&im, pad, pad, ts, ts, Mix(s.accent, (Color){0,0,0,255}, 0.18f));
+    ImageDrawRectangle(&im, pad, pad, ts, ts, Mix(s.accent, (Color){0,0,0,255}, 0.18f));   // logo tile (bevel)
     ImageDrawRectangle(&im, pad, pad, ts, ts/2, Mix(s.accent, (Color){255,255,255,255}, 0.12f));
     ImageDrawRectangle(&im, pad+2*S, pad+3*S, ts-4*S, ts-5*S, s.accent);
-    Font f = GetFontDefault();
     char init[2] = { (char)(s.name[0]>='a'&&s.name[0]<='z' ? s.name[0]-32 : s.name[0]), 0 };
     float ifs = ts*0.6f; Vector2 iz = MeasureTextEx(f, init, ifs, 1);
     ImageDrawTextEx(&im, f, init, (Vector2){ pad + (ts-iz.x)/2, pad + (ts-iz.y)/2 }, ifs, 1, s.bg);
 
-    int tx = pad + ts + 20*S;                                      // wordmark + soft shadow
-    float nfs = 46*S, nsp = 3*S; Vector2 nz = MeasureTextEx(f, s.name, nfs, nsp);
-    float ny = (H - nz.y)/2 - 9*S;
+    float ny = (H - nz.y)/2 - 9*S;                                 // wordmark + soft shadow
     ImageDrawTextEx(&im, f, s.name, (Vector2){ tx+2*S, ny+3*S }, nfs, nsp, (Color){0,0,0,90});
     ImageDrawTextEx(&im, f, s.name, (Vector2){ tx, ny }, nfs, nsp, s.fg);
     ImageDrawRectangle(&im, tx, (int)(ny+nz.y+5*S), (int)nz.x, 3*S, s.accent);   // accent underline
     if (s.tag) ImageDrawTextEx(&im, f, s.tag, (Vector2){ tx, ny+nz.y+11*S }, 20*S, 1*S, Mix(s.fg, s.bg, 0.4f));
 
-    ImageResize(&im, 512, 128);                                    // downsample -> crisp
+    ImageResize(&im, W/S, H/S);                                    // downsample -> crisp, aspect preserved
     Texture2D t = LoadTextureFromImage(im);
     SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
     UnloadImage(im);
@@ -869,12 +872,20 @@ static void DrawFloodlight(float x, float z)
 // pitch-side sponsor hoardings, a row behind the goal facing the pitch
 static void DrawBanners(void)
 {
-    const int n = 9;
-    float bw = 3.3f, bh = 0.9f, y = 0.72f, z = GOAL_Z + 2.15f;
-    DrawCube((Vector3){0, y, z + 0.06f}, n*bw, bh + 0.12f, 0.1f, (Color){18,20,26,255});   // backing rail
+    const int n = NSPON;
+    float bh = 0.9f, y = 0.72f, z = GOAL_Z + 2.15f, gap = 0.22f;
+    float w[NSPON], total = 0.0f;                        // each board as wide as its (variable) texture
     for (int i = 0; i < n; i++) {
-        float x = (-(n-1)/2.0f + i) * bw;
-        DrawDecal(gBannerTex[(i + g.round) % NSPON], (Vector3){x, y, z}, (Vector3){0,0,-1}, (Vector3){0,1,0}, bw*0.96f, bh);
+        Texture2D t = gBannerTex[(i + g.round) % NSPON];
+        w[i] = bh * ((float)t.width / (float)t.height);
+        total += w[i] + (i ? gap : 0.0f);
+    }
+    DrawCube((Vector3){0, y, z + 0.06f}, total + 0.5f, bh + 0.12f, 0.1f, (Color){18,20,26,255});   // backing rail
+    float x = -total/2.0f;
+    for (int i = 0; i < n; i++) {
+        Texture2D t = gBannerTex[(i + g.round) % NSPON];
+        DrawDecal(t, (Vector3){x + w[i]/2.0f, y, z}, (Vector3){0,0,-1}, (Vector3){0,1,0}, w[i], bh);
+        x += w[i] + gap;
     }
 }
 static void DrawStadium(void)
