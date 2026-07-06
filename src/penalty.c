@@ -393,7 +393,8 @@ static void Resolve(Result r)
 {
     g.result = r; g.resolved = true; g.resultTimer = 0.0f;
     if (g.kick < KICKS_TOTAL) g.kickRes[g.kick] = r;
-    if (r == RES_GOAL) { g.scored++; g.celebrate = 1.7f; }
+    if (r == RES_GOAL) g.scored++;
+    g.celebrate = 1.7f;                 // crowd-reaction window (each stand reacts by outcome)
     g.reactAnim = GetRandomValue(0, 4);
     g.reactCelebrate = (r != RES_GOAL);
     g.reactHeld = (r == RES_SAVE && g.caught);
@@ -515,18 +516,26 @@ static void DrawBoardOverlay(void)   // project the board rect + render the live
 static void DrawStadium(void)
 {
     float t = GetTime();
-    bool cel = g.celebrate > 0.0f;
+    bool react = g.celebrate > 0.0f;
+    bool kickerScored = (g.result == RES_GOAL);       // kicker's fans sit in the away (right) stand
     const int ROWS = 7, COLS = 54;
     for (int r = 0; r < ROWS; r++) {
         float z = GOAL_Z + 2.7f + r*1.15f;
         float y = 0.2f + r*0.8f;
-        DrawCube((Vector3){0, y - 0.5f, z}, 36.0f, 1.0f, 1.15f, (Color){ 58,60,70,255 });      // concrete tier
-        DrawCube((Vector3){0, y - 0.02f, z - 0.5f}, 36.0f, 0.09f, 0.12f, (Color){ 40,42,50,255 }); // step nose
+        DrawCube((Vector3){0, y - 0.5f, z}, 36.0f, 1.0f, 1.15f, (Color){ 58,60,70,255 });
+        DrawCube((Vector3){0, y - 0.02f, z - 0.5f}, 36.0f, 0.09f, 0.12f, (Color){ 40,42,50,255 });
         for (int c = 0; c < COLS; c++) {
             int h = (r*37 + c*19) % 100;
             float x = -17.0f + c*(34.0f/(COLS-1));
-            float jump = cel ? fabsf(sinf(t*12.0f + h))*0.32f : fabsf(sinf(t*1.1f + h))*0.03f;
-            DrawCube((Vector3){x, y + 0.35f + jump, z}, 0.26f, 0.4f, 0.26f, FanColor(x, h));
+            // ambient: a slow rolling wave + a gentle per-fan bob
+            float yoff = fmaxf(0.0f, sinf(t*1.3f - x*0.22f))*0.10f + sinf(t*2.0f + h)*0.03f;
+            if (react) {
+                bool home = (x < 0.0f);                                  // home = the keeper's stand
+                bool happy = home ? !kickerScored : kickerScored;        // each stand reacts to the outcome
+                if (happy) yoff = fabsf(sinf(t*12.0f + h)) * 0.36f;       // leaping to their feet
+                else       yoff = -0.14f + sinf(t*2.5f + h)*0.02f;        // slumped, seated
+            }
+            DrawCube((Vector3){x, y + 0.35f + yoff, z}, 0.26f, 0.4f, 0.26f, FanColor(x, h));
         }
     }
 }
@@ -557,6 +566,40 @@ static void FireShot(void)
     g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
     CommitKeeperDive();
     g.phase = PHASE_FLY;
+}
+
+// ---- keeper model (Mii-ish: head + rounded body + arms; hip anchors reserved for legs) ----
+static void DrawKeeper(void)
+{
+    Vector3 up = (Vector3Length(g.kprAxis) > 0.1f) ? Vector3Normalize(g.kprAxis) : (Vector3){0,1,0};
+    Vector3 side = Vector3CrossProduct(up, (Vector3){0,0,1});
+    if (Vector3Length(side) < 0.1f) side = (Vector3){1,0,0};
+    side = Vector3Normalize(side);
+
+    Vector3 hip      = Vector3Add(g.kprPos, Vector3Scale(up, -0.30f));
+    Vector3 shoulder = Vector3Add(g.kprPos, Vector3Scale(up,  0.26f));
+    Vector3 headPos  = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(up, 0.60f)), g.kprHeadOff);
+
+    Color kit  = gHome.a;
+    if (g.resolved && !g.reactCelebrate)
+        kit = (Color){ (unsigned char)(kit.r*0.7f), (unsigned char)(kit.g*0.7f), (unsigned char)(kit.b*0.7f), 255 };
+    Color skin = (Color){ 245, 205, 160, 255 };
+
+    DrawCapsule(hip, shoulder, 0.30f, 12, 10, kit);               // rounded torso
+    DrawSphere(headPos, 0.30f, skin);                             // big Mii-style head
+    Vector3 shL = Vector3Add(shoulder, Vector3Scale(side, -0.28f));
+    Vector3 shR = Vector3Add(shoulder, Vector3Scale(side,  0.28f));
+    DrawCylinderEx(shL, g.kprGL, 0.09f, 0.06f, 8, kit);           // upper arms -> gloves
+    DrawCylinderEx(shR, g.kprGR, 0.09f, 0.06f, 8, kit);
+    DrawSphere(g.kprGL, GLOVE_R, gHome.b);                        // gloves (hands)
+    DrawSphere(g.kprGR, GLOVE_R, gHome.b);
+
+    // hip anchors — attach points for legs (a future session hangs cylinders from these)
+    Vector3 hipL = Vector3Add(hip, Vector3Scale(side, -0.15f));
+    Vector3 hipR = Vector3Add(hip, Vector3Scale(side,  0.15f));
+    DrawSphere(hipL, 0.12f, kit);
+    DrawSphere(hipR, 0.12f, kit);
+    // legs: DrawCylinderEx(hipL, footL, ...) / (hipR, footR, ...) once foot targets exist.
 }
 
 // ---- main frame ---------------------------------------------------------
@@ -647,18 +690,7 @@ static void UpdateDrawFrame(void)
         DrawCube((Vector3){ GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
-        {   // keeper — sprung pose (ragdoll feel)
-            Vector3 axis = g.kprAxis;
-            Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), g.kprHeadOff);
-            Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
-            Color body = gHome.a;                                   // home keeper kit
-            if (g.resolved && !g.reactCelebrate)
-                body = (Color){ (unsigned char)(body.r*0.68f), (unsigned char)(body.g*0.68f), (unsigned char)(body.b*0.68f), 255 };
-            DrawCapsule(feet, head, 0.26f, 8, 8, body);
-            DrawSphere(head, 0.17f, (Color){ 250, 225, 130, 255 });
-            DrawSphere(g.kprGL, GLOVE_R, gHome.b);
-            DrawSphere(g.kprGR, GLOVE_R, gHome.b);
-        }
+        DrawKeeper();
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
             Strike s = { .power = 13.0f + g.power01*16.0f, .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve*3.0f };
