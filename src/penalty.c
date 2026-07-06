@@ -466,20 +466,11 @@ static Color FanColor(float x, int h)
     if (m == 0) return (Color){235,235,235,255};
     return (m <= 2) ? tm.a : tm.b;
 }
-static void DrawScoreboard(void)   // physical jumbotron; screen content is a 2D overlay
-{
-    Vector3 c = (Vector3){ 0.0f, BOARD_Y, BOARD_Z };
-    DrawCube((Vector3){-BOARD_HW-0.1f, 3.1f, c.z + 0.15f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
-    DrawCube((Vector3){ BOARD_HW+0.1f, 3.1f, c.z + 0.15f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
-    DrawCube(c, BOARD_HW*2+0.6f, BOARD_HH*2+0.6f, 0.22f, (Color){26,28,36,255});                  // bezel
-    DrawCube((Vector3){0, c.y, c.z - 0.05f}, BOARD_HW*2, BOARD_HH*2, 0.08f, (Color){8,9,14,255}); // dark screen
-}
 static void DrawBoardOverlay(void)   // project the board rect + render the live match in an era style
 {
-    Vector2 tl = GetWorldToScreen((Vector3){ -BOARD_HW, BOARD_Y+BOARD_HH, BOARD_Z-0.1f }, g.cam);
-    Vector2 br = GetWorldToScreen((Vector3){  BOARD_HW, BOARD_Y-BOARD_HH, BOARD_Z-0.1f }, g.cam);
-    Rectangle rect = { tl.x, tl.y, br.x - tl.x, br.y - tl.y };
-    if (rect.width < 40 || rect.height < 18) return;
+    int W = GetScreenWidth(), H = GetScreenHeight();
+    float bw = fminf(W * 0.64f, 640.0f);
+    Rectangle rect = { (W - bw) * 0.5f, H * 0.03f, bw, bw / 3.3f };   // fixed top-center panel
 
     BoardData bd = (BoardData){0};
     bd.era = gEra; bd.year = ERA_YEARS[gEra]; bd.title = "PENALTY SHOOTOUT";
@@ -617,7 +608,6 @@ static void UpdateDrawFrame(void)
     ClearBackground((Color){ 20, 24, 32, 255 });
     BeginMode3D(g.cam);
         DrawStadium();
-        DrawScoreboard();
         DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
         DrawPitch();
         DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
