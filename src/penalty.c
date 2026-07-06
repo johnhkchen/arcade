@@ -53,8 +53,8 @@ typedef struct {
     // flow
     int     kick, scored;
     Result  result;
-    bool    resolved, caught;
-    float   resultTimer, celebrate;
+    bool    resolved, caught, hitWood;
+    float   resultTimer, celebrate, flight;
     Camera3D cam;
 } Game;
 
@@ -211,7 +211,8 @@ static void StartKick(void)
     g.ball.pos = (Vector3){0.0f, BALL_R, 0.0f};
     ResetKeeper();
     InitNet();
-    g.result = RES_NONE; g.resolved = false; g.caught = false; g.resultTimer = 0.0f;
+    g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
+    g.resultTimer = 0.0f; g.flight = 0.0f;
 }
 
 static void ResetMatch(void) { g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick(); }
@@ -251,31 +252,44 @@ static void StepBallLive(float dt)
 {
     const int N = 8;
     for (int i = 0; i < N; i++) {
+        Vector3 prev = g.ball.pos;
         BallStep(&g.ball, dt / N);
         Vector3 p = g.ball.pos;
+
         if (KeeperDeflect()) { Resolve(RES_SAVE); return; }
-        if (p.z >= GOAL_Z - 0.12f && p.z <= GOAL_Z + 0.2f) {
-            bool hitPost = (fabsf(fabsf(p.x) - GOAL_HALF_W) < BALL_R + POST_R) && p.y > 0 && p.y < GOAL_H + 0.1f;
-            bool hitBar  = (fabsf(p.y - GOAL_H) < BALL_R + POST_R) && fabsf(p.x) < GOAL_HALF_W;
-            if (hitPost || hitBar) {
-                if (hitPost) g.ball.vel.x *= -0.5f;
-                if (hitBar)  g.ball.vel.y *= -0.5f;
-                Resolve(RES_POST); return;
+
+        // crossing the goal-line plane — interpolate the exact crossing point
+        if (prev.z < GOAL_Z && p.z >= GOAL_Z) {
+            float t  = (GOAL_Z - prev.z) / (p.z - prev.z);
+            float xc = prev.x + (p.x - prev.x) * t;
+            float yc = prev.y + (p.y - prev.y) * t;
+            bool onPost = fabsf(fabsf(xc) - GOAL_HALF_W) < BALL_R + POST_R && yc > 0.0f && yc < GOAL_H + 0.15f;
+            bool onBar  = fabsf(yc - GOAL_H) < BALL_R + POST_R && fabsf(xc) < GOAL_HALF_W + 0.15f;
+
+            if (onPost || onBar) {                 // hit the woodwork: BOUNCE, don't verdict
+                Vector3 axisPt = onBar ? (Vector3){ p.x, GOAL_H, GOAL_Z }
+                                       : (Vector3){ (xc > 0 ? GOAL_HALF_W : -GOAL_HALF_W), p.y, GOAL_Z };
+                Vector3 nrm = Vector3Subtract(p, axisPt);
+                nrm = (Vector3Length(nrm) > 1e-4f) ? Vector3Normalize(nrm) : (Vector3){0, 0, -1};
+                g.ball.vel = Vector3Scale(Vector3Reflect(g.ball.vel, nrm), 0.6f);
+                g.ball.pos.z = GOAL_Z - BALL_R;    // back in play — its real path decides
+                g.hitWood = true;
+            } else {                               // clean pass through the plane
+                bool in = fabsf(xc) < GOAL_HALF_W && yc > 0.0f && yc < GOAL_H;
+                Resolve(in ? RES_GOAL : (g.hitWood ? RES_POST : RES_MISS));
+                return;
             }
         }
-        if (p.z >= GOAL_Z) {
-            bool in = fabsf(p.x) < GOAL_HALF_W && p.y > 0 && p.y < GOAL_H;
-            Resolve(in ? RES_GOAL : RES_MISS);
-            return;
-        }
+
         if (g.ball.pos.y <= BALL_R) {
             g.ball.pos.y = BALL_R;
             if (g.ball.vel.y < -1.6f) { g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.9f; g.ball.vel.z *= 0.9f; }
             else { g.ball.vel.y = 0.0f; float roll = 1.0f - 0.35f*(dt/N); g.ball.vel.x *= roll; g.ball.vel.z *= roll; }
         }
     }
+    // came to rest without entering the goal
     if (g.ball.pos.z < GOAL_Z - 0.3f && g.ball.pos.y <= BALL_R + 0.05f && Vector3Length(g.ball.vel) < 0.5f)
-        Resolve(RES_MISS);
+        Resolve(g.hitWood ? RES_POST : RES_MISS);
 }
 
 static void StepBallSettle(float dt)
@@ -385,6 +399,7 @@ static void UpdateDrawFrame(void)
         StepNet(dt);
         if (!g.resolved) StepBallLive(dt);
         else             StepBallSettle(dt);
+        if (!g.resolved) { g.flight += dt; if (g.flight > 4.0f) Resolve(g.hitWood ? RES_POST : RES_MISS); }
         if (g.resolved) {
             g.resultTimer += dt;
             if (g.resultTimer > SETTLE_TIME) {
