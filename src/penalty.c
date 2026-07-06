@@ -304,7 +304,8 @@ static void StepBallSettle(float dt)
     float backZ = GOAL_Z + NET_DEPTH;
     for (int i = 0; i < N; i++) {
         BallStep(&g.ball, dt / N);
-        if (g.ball.pos.z > GOAL_Z) {
+        // net catch ONLY when the ball is inside the goal frame (wide/high misses fly past)
+        if (g.ball.pos.z > GOAL_Z && fabsf(g.ball.pos.x) < GOAL_HALF_W && g.ball.pos.y < GOAL_H) {
             g.ball.vel = Vector3Scale(g.ball.vel, 1.0f - 4.5f*(dt/N));   // net absorbs
             if (g.ball.pos.z > backZ + 0.35f) { g.ball.pos.z = backZ + 0.35f; if (g.ball.vel.z > 0) g.ball.vel.z *= -0.12f; }
             if (g.ball.pos.x >  GOAL_HALF_W - BALL_R) { g.ball.pos.x =  GOAL_HALF_W - BALL_R; g.ball.vel.x *= -0.2f; }
