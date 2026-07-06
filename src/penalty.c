@@ -183,8 +183,18 @@ static bool KeeperDeflect(void)
         Vector3 d = Vector3Subtract(g.ball.pos, col[i]);
         float len = Vector3Length(d);
         if (len < BALL_R + rad[i]) {
-            g.ball.vel = (Vector3){0};    // grasped — held, never spills into the net
-            g.caught = true;
+            Vector3 n = (len > 1e-3f) ? Vector3Scale(d, 1.0f/len) : (Vector3){0, 0, -1};
+            float punch = fmaxf(0.0f, Vector3DotProduct(g.kprVel, n));
+            Vector3 parry = Vector3Add(Vector3Scale(Vector3Reflect(g.ball.vel, n), 0.5f),
+                                       Vector3Scale(n, punch * 0.9f + 2.5f));
+            parry.y += 1.5f;                       // a little lift — nicer deflection
+            if (parry.z < -0.6f) {                 // heading clearly out: parry it away
+                g.ball.vel = parry;
+                g.caught = false;
+            } else {                               // a parry would risk the net: catch it
+                g.ball.vel = (Vector3){0};
+                g.caught = true;
+            }
             return true;
         }
     }
