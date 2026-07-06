@@ -148,31 +148,26 @@ static void BuildBallSvg(char *b)
     }
     sprintf(b+o, "</svg>");
 }
-// A shaded skin head with a hair cap, baked per pixel of an equirectangular map.
-// Both the top-light gradient and the hair band are functions of latitude only,
-// so the head reads correctly at any spin about its pole (which we aim at "up").
+// A shaded skin head with a hair cap. In raylib's sphere UVs, texcoord.x is the
+// polar angle from the +Z pole and texcoord.y is azimuth — so hair and shading
+// key on the COLUMN only (azimuth-invariant): a clean cap around +Z, no seam.
+// We then aim the model's +Z at "up", putting the cap on the crown.
 static Image BuildHeadImage(Color skin, Color hair)
 {
-    const int W = 160, H = 96;
+    const int W = 192, H = 32;
     unsigned char *px = (unsigned char *)malloc((size_t)W*H*4);
-    for (int y = 0; y < H; y++) {
-        float lat = (float)y / (H - 1);                       // 0 = crown, 1 = chin/neck
-        float shade = Clamp(1.12f - lat*0.62f - 0.20f*fmaxf(0.0f, lat-0.75f)*4.0f, 0.55f, 1.12f);
-        for (int x = 0; x < W; x++) {
-            float u = (float)x / (W - 1);
-            // hair: a cap over the crown with a soft, slightly scalloped fringe
-            float fringe = 0.30f + 0.045f*sinf(u*2*PI*3.0f) + 0.02f*sinf(u*2*PI*7.0f);
-            Color c;
-            if (lat < fringe) {
-                float hs = Clamp(1.05f - lat*0.5f, 0.7f, 1.1f);
-                c = (Color){ (unsigned char)(hair.r*hs), (unsigned char)(hair.g*hs), (unsigned char)(hair.b*hs), 255 };
-            } else {
-                c = (Color){ (unsigned char)fminf(skin.r*shade,255), (unsigned char)fminf(skin.g*shade,255),
-                             (unsigned char)fminf(skin.b*shade,255), 255 };
-            }
-            unsigned char *p = px + ((size_t)y*W + x)*4;
-            p[0]=c.r; p[1]=c.g; p[2]=c.b; p[3]=255;
+    for (int x = 0; x < W; x++) {
+        float polar = (float)x / (W - 1);                    // 0 = crown (+Z), 1 = neck (-Z)
+        float shade = Clamp(1.13f - polar*0.5f - fmaxf(0.0f, polar-0.8f)*1.4f, 0.55f, 1.13f);
+        Color c;
+        if (polar < 0.30f) {                                 // hair cap over the crown
+            float hs = Clamp(1.06f - polar*0.7f, 0.72f, 1.06f);
+            c = (Color){ (unsigned char)(hair.r*hs), (unsigned char)(hair.g*hs), (unsigned char)(hair.b*hs), 255 };
+        } else {
+            c = (Color){ (unsigned char)fminf(skin.r*shade,255), (unsigned char)fminf(skin.g*shade,255),
+                         (unsigned char)fminf(skin.b*shade,255), 255 };
         }
+        for (int y = 0; y < H; y++) { unsigned char *p = px + ((size_t)y*W + x)*4; p[0]=c.r; p[1]=c.g; p[2]=c.b; p[3]=255; }
     }
     return (Image){ px, W, H, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
 }
@@ -181,39 +176,39 @@ static Image BuildHeadImage(Color skin, Color hair)
 static void BuildExprSvg(char *b, int expr)
 {
     int o = sprintf(b, "<svg viewBox='0 0 100 100'>");
-    o += sprintf(b+o, "<ellipse cx='37' cy='55' rx='11' ry='11' fill='#00000014'/>");   // soft sockets
-    o += sprintf(b+o, "<ellipse cx='63' cy='55' rx='11' ry='11' fill='#00000014'/>");
+    o += sprintf(b+o, "<ellipse cx='35' cy='49' rx='12' ry='12' fill='#00000014'/>");   // soft sockets
+    o += sprintf(b+o, "<ellipse cx='65' cy='49' rx='12' ry='12' fill='#00000014'/>");
     const char *browL, *browR, *mouth; float ey, eyry, pdy;
     switch (expr) {
     case EXPR_WORRY:                                                                    // brows up-inner, wide eyes
-        browL = "<path d='M27,44 L44,40' stroke='#2a2620' stroke-width='4'/>";
-        browR = "<path d='M56,40 L73,44' stroke='#2a2620' stroke-width='4'/>";
-        mouth = "<ellipse cx='50' cy='75' rx='5' ry='6' fill='#4a1c18'/>";
-        ey = 55; eyry = 9.5f; pdy = 1.5f; break;
+        browL = "<path d='M23,37 L45,32' stroke='#2a2620' stroke-width='5'/>";
+        browR = "<path d='M55,32 L77,37' stroke='#2a2620' stroke-width='5'/>";
+        mouth = "<ellipse cx='50' cy='73' rx='6' ry='7' fill='#4a1c18'/>";
+        ey = 49; eyry = 11.0f; pdy = 2.0f; break;
     case EXPR_HAPPY:                                                                    // arched brows, big smile
-        browL = "<path d='M28,40 Q36,36 45,40' stroke='#2a2620' stroke-width='4' fill='none'/>";
-        browR = "<path d='M55,40 Q64,36 72,40' stroke='#2a2620' stroke-width='4' fill='none'/>";
-        mouth = "<path d='M36,72 Q50,86 64,72 Q50,78 36,72 Z' fill='#7a2a24'/>";
-        ey = 54; eyry = 8.0f; pdy = -1.5f; break;
+        browL = "<path d='M23,33 Q35,28 46,33' stroke='#2a2620' stroke-width='5' fill='none'/>";
+        browR = "<path d='M54,33 Q65,28 77,33' stroke='#2a2620' stroke-width='5' fill='none'/>";
+        mouth = "<path d='M33,68 Q50,86 67,68 Q50,76 33,68 Z' fill='#7a2a24'/>";
+        ey = 48; eyry = 9.5f; pdy = -2.0f; break;
     case EXPR_ANGRY:                                                                    // furrowed brows, grimace
-        browL = "<path d='M28,40 L45,47' stroke='#241f1a' stroke-width='5'/>";
-        browR = "<path d='M55,47 L72,40' stroke='#241f1a' stroke-width='5'/>";
-        mouth = "<path d='M37,78 Q50,72 63,78' stroke='#5a201c' stroke-width='4' fill='none'/>";
-        ey = 56; eyry = 7.0f; pdy = 1.0f; break;
+        browL = "<path d='M23,33 L46,42' stroke='#241f1a' stroke-width='6'/>";
+        browR = "<path d='M54,42 L77,33' stroke='#241f1a' stroke-width='6'/>";
+        mouth = "<path d='M34,77 Q50,69 66,77' stroke='#5a201c' stroke-width='5' fill='none'/>";
+        ey = 51; eyry = 8.0f; pdy = 1.5f; break;
     default:            /* EXPR_FOCUS */                                               // level brows, steady eyes
-        browL = "<path d='M28,42 L45,43' stroke='#2a2620' stroke-width='4'/>";
-        browR = "<path d='M55,43 L72,42' stroke='#2a2620' stroke-width='4'/>";
-        mouth = "<path d='M42,75 L58,75' stroke='#6a2620' stroke-width='3'/>";
-        ey = 55; eyry = 8.5f; pdy = 1.0f; break;
+        browL = "<path d='M23,35 L46,36' stroke='#2a2620' stroke-width='5'/>";
+        browR = "<path d='M54,36 L77,35' stroke='#2a2620' stroke-width='5'/>";
+        mouth = "<path d='M40,74 L60,74' stroke='#6a2620' stroke-width='4'/>";
+        ey = 49; eyry = 10.0f; pdy = 1.5f; break;
     }
     o += sprintf(b+o, "%s%s", browL, browR);
-    o += sprintf(b+o, "<ellipse cx='37' cy='%.1f' rx='7.5' ry='%.1f' fill='#ffffff'/>", ey, eyry);
-    o += sprintf(b+o, "<ellipse cx='63' cy='%.1f' rx='7.5' ry='%.1f' fill='#ffffff'/>", ey, eyry);
-    o += sprintf(b+o, "<circle cx='38' cy='%.1f' r='3.7' fill='#241c18'/>", ey+pdy);
-    o += sprintf(b+o, "<circle cx='62' cy='%.1f' r='3.7' fill='#241c18'/>", ey+pdy);
-    o += sprintf(b+o, "<circle cx='39.3' cy='%.1f' r='1.3' fill='#ffffff'/>", ey+pdy-1.6f);
-    o += sprintf(b+o, "<circle cx='63.3' cy='%.1f' r='1.3' fill='#ffffff'/>", ey+pdy-1.6f);
-    o += sprintf(b+o, "<path d='M50,58 L46.5,67 L53.5,67' fill='none' stroke='#00000022' stroke-width='2'/>");
+    o += sprintf(b+o, "<ellipse cx='35' cy='%.1f' rx='9' ry='%.1f' fill='#ffffff'/>", ey, eyry);
+    o += sprintf(b+o, "<ellipse cx='65' cy='%.1f' rx='9' ry='%.1f' fill='#ffffff'/>", ey, eyry);
+    o += sprintf(b+o, "<circle cx='36' cy='%.1f' r='4.4' fill='#241c18'/>", ey+pdy);
+    o += sprintf(b+o, "<circle cx='64' cy='%.1f' r='4.4' fill='#241c18'/>", ey+pdy);
+    o += sprintf(b+o, "<circle cx='37.6' cy='%.1f' r='1.6' fill='#ffffff'/>", ey+pdy-1.9f);
+    o += sprintf(b+o, "<circle cx='65.6' cy='%.1f' r='1.6' fill='#ffffff'/>", ey+pdy-1.9f);
+    o += sprintf(b+o, "<path d='M50,53 L45,65 L55,65' fill='none' stroke='#00000022' stroke-width='2.5'/>");
     o += sprintf(b+o, "%s</svg>", mouth);
 }
 static void LoadArt(void)
@@ -928,27 +923,22 @@ static void DrawKeeper(void)
     DrawSphere(g.kprGL, GLOVE_R, gHome.b);                       // gloves (hands)
     DrawSphere(g.kprGR, GLOVE_R, gHome.b);
 
-    // ---- head: shaded skin sphere, pole aimed along "up" ----
+    // ---- head: shaded skin sphere, its +Z pole (hair cap) aimed at "up" ----
     gHeadModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = gHeadTex[gFaceSel];
-    gHeadModel.transform = QuaternionToMatrix(QuaternionFromVector3ToVector3((Vector3){0,1,0}, up));
+    gHeadModel.transform = QuaternionToMatrix(QuaternionFromVector3ToVector3((Vector3){0,0,1}, up));
     DrawModel(gHeadModel, headPos, 1.0f, WHITE);
 
-    // ---- face: an expression decal that turns to watch the ball ----
+    // ---- face: an expression decal, presented mostly to the front but turning
+    // a touch toward the ball so the keeper reads as watching it ----
     int expr = EXPR_FOCUS;
     if (g.resolved)            expr = g.reactCelebrate ? EXPR_HAPPY : EXPR_ANGRY;
     else if (Vector3Length(Vector3Subtract(g.ball.pos, headPos)) < 1.7f) expr = EXPR_WORRY;
-    // gaze: toward the ball in play, otherwise forward; clamp to a 75° front cone
-    Vector3 look = (!g.resolved) ? Vector3Subtract(g.ball.pos, headPos) : fwd;
-    if (Vector3Length(look) < 1e-3f) look = fwd;
-    look = Vector3Normalize(look);
-    float d = Vector3DotProduct(look, fwd), cmin = cosf(75.0f*DEG2RAD);
-    if (d < cmin) {
-        Vector3 perp = Vector3Subtract(look, Vector3Scale(fwd, d));
-        look = (Vector3Length(perp) < 1e-3f) ? fwd
-             : Vector3Normalize(Vector3Add(Vector3Scale(fwd, cmin), Vector3Scale(Vector3Normalize(perp), sinf(75.0f*DEG2RAD))));
-    }
-    Vector3 facePos = Vector3Add(headPos, Vector3Scale(look, 0.285f));
-    DrawDecal(gExprTex[expr], facePos, look, up, 0.46f, 0.46f);
+    Vector3 gaze = (!g.resolved) ? Vector3Subtract(g.ball.pos, headPos) : fwd;
+    if (Vector3Length(gaze) < 1e-3f) gaze = fwd;
+    gaze = Vector3Normalize(gaze);
+    Vector3 look = Vector3Normalize(Vector3Lerp(fwd, gaze, 0.35f));   // subtle turn, stays front-on
+    Vector3 facePos = Vector3Add(headPos, Vector3Scale(look, 0.30f));
+    DrawDecal(gExprTex[expr], facePos, look, up, 0.58f, 0.58f);
 }
 
 // ---- replay camera ------------------------------------------------------
