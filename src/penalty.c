@@ -248,7 +248,6 @@ static Texture2D BakeBanner(Sponsor s)
         Vector2 tg = MeasureTextEx(f, s.tag, 18, 2);
         ImageDrawTextEx(&im, f, s.tag, (Vector2){ (W-tg.x)/2, 92 }, 18, 2, s.accent);
     }
-    ImageFlipHorizontal(&im);                                       // DrawDecal mirrors u; pre-flip so text reads
     Texture2D t = LoadTextureFromImage(im);
     SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
     UnloadImage(im);
