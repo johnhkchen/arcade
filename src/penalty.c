@@ -270,8 +270,9 @@ static void StepBallLive(float dt)
 
 static void StepBallSettle(float dt)
 {
-    if (g.caught) {   // keeper cradles it — follow the diving body, never spills in
-        g.ball.pos = Vector3Add(g.kprPos, (Vector3){ 0.0f, -0.05f, -0.30f });
+    if (g.caught) {   // hands gather the ball in — reach, then guide, no snapping
+        Vector3 cradle = Vector3Add(g.kprPos, (Vector3){ 0.0f, -0.05f, -0.30f });
+        g.ball.pos = Vector3Lerp(g.ball.pos, cradle, Clamp(6.0f * dt, 0.0f, 1.0f));
         g.ball.vel = (Vector3){0};
         return;
     }
