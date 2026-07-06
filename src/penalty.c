@@ -19,7 +19,7 @@
 #include <emscripten/emscripten.h>
 #endif
 
-#define GOAL_Z         18.0f
+#define GOAL_Z         11.0f   /* ~12 yds — regulation penalty distance */
 #define GOAL_HALF_W     3.66f   // half of a 7.32m goal
 #define GOAL_H          2.44f
 #define BALL_R          0.11f
@@ -27,7 +27,7 @@
 #define KICKS_TOTAL     5
 
 // keeper
-#define KPR_REACH       1.15f   // body+arm reach radius
+#define KPR_REACH       1.05f   // body+arm reach radius
 #define KPR_DIVE_SPEED  8.5f     // m/s, finite — this is what makes corners score
 #define KPR_ACCEL      55.0f
 #define KPR_HOME_Y      1.05f
@@ -103,11 +103,11 @@ static void CommitKeeperDive(void)
 {
     float px, py; PredictCrossing(&px, &py);
     // dumb read: partial confidence + error, sometimes wrong-footed entirely
-    float err = Frand2() * 1.6f;
-    if (Frand() < 0.15f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;   // occasional wrong guess
+    float err = Frand2() * 1.9f;
+    if (Frand() < 0.18f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;   // occasional wrong guess
     g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
     g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
-    g.kprReact = 0.12f + Frand() * 0.10f;
+    g.kprReact = 0.16f + Frand() * 0.12f;
     g.kprVel = (Vector3){0};
 }
 
@@ -152,11 +152,22 @@ static void StepBall(float dt)
             g.result = in ? RES_GOAL : RES_MISS;
             break;
         }
-        // turf
-        if (p.y < BALL_R) { g.ball.pos.y = BALL_R; g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.8f; g.ball.vel.z *= 0.85f; }
+        // turf: bounce when descending fast, otherwise settle and ROLL toward goal
+        if (g.ball.pos.y <= BALL_R) {
+            g.ball.pos.y = BALL_R;
+            if (g.ball.vel.y < -1.6f) {                  // a real bounce
+                g.ball.vel.y *= -0.45f;
+                g.ball.vel.x *= 0.9f; g.ball.vel.z *= 0.9f;
+            } else {                                      // rolling on the grass
+                g.ball.vel.y = 0.0f;
+                float roll = 1.0f - 0.35f * (dt / N);     // light rolling friction
+                g.ball.vel.x *= roll; g.ball.vel.z *= roll;
+            }
+        }
     }
-    // rolled to a stop short of goal
-    if (g.result == RES_NONE && g.ball.pos.z < GOAL_Z - 0.5f && Vector3Length(g.ball.vel) < 1.5f)
+    // a MISS only once it has actually stopped on the grass short of goal
+    if (g.result == RES_NONE && g.ball.pos.z < GOAL_Z - 0.3f &&
+        g.ball.pos.y <= BALL_R + 0.05f && Vector3Length(g.ball.vel) < 0.5f)
         g.result = RES_MISS;
 }
 
