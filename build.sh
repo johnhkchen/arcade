@@ -20,7 +20,7 @@ RAYLIB_LIB="$RAYLIB_SRC/libraylib.web.a"
 mkdir -p "$ROOT/dist/$GAME"
 echo ">> compiling $GAME → dist/$GAME/index.html"
 emcc -o "$ROOT/dist/$GAME/index.html" \
-  "$ROOT/src/$GAME.c" "$ROOT/src/ballstrike.c" \
+  "$ROOT/src/$GAME.c" "$ROOT/src/ballstrike.c" "$ROOT/src/jumbotron.c" \
   -I"$RAYLIB_SRC" \
   "$RAYLIB_LIB" \
   -DPLATFORM_WEB \

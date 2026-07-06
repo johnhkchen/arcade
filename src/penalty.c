@@ -3,6 +3,7 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "ballstrike.h"
+#include "jumbotron.h"
 #include <math.h>
 
 #if defined(PLATFORM_WEB)
@@ -32,6 +33,10 @@
 
 #define NET_NX         17
 #define NET_NY         11
+#define BOARD_Y         6.2f
+#define BOARD_Z        (GOAL_Z + 8.0f)
+#define BOARD_HW        6.0f
+#define BOARD_HH        1.7f
 
 typedef enum { PHASE_AIM, PHASE_CHARGE, PHASE_FLY, PHASE_RESULT } Phase;
 typedef enum { RES_NONE, RES_GOAL, RES_SAVE, RES_POST, RES_MISS } Result;
@@ -75,7 +80,8 @@ static const Team TEAMS[] = {
     {{0,90,160,255},{240,220,40,255}},   {{150,20,50,255},{240,240,240,255}},
 };
 static Team gHome, gAway;
-static RenderTexture2D gBoard;   // the jumbotron's live screen
+static BoardEra gEra;
+static const char *ERA_YEARS[ERA_COUNT] = { "1978", "1994", "2006", "2022" };
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
@@ -342,6 +348,7 @@ static void ResetMatch(void)
     if (ai >= hi) ai++;                                  // distinct matchup
     gHome = TEAMS[hi]; gAway = TEAMS[ai];
     for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
+    gEra = (BoardEra)GetRandomValue(0, ERA_COUNT-1);
     g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick();
 }
 
@@ -459,47 +466,37 @@ static Color FanColor(float x, int h)
     if (m == 0) return (Color){235,235,235,255};
     return (m <= 2) ? tm.a : tm.b;
 }
-// render the live match onto the jumbotron texture (call before BeginDrawing)
-static void RenderBoard(void)
+static void DrawScoreboard(void)   // physical jumbotron; screen content is a 2D overlay
 {
-    const int BW = 512, BH = 160;
-    BeginTextureMode(gBoard);
-    ClearBackground((Color){ 14, 16, 24, 255 });
-    DrawRectangle(0, 0, 20, BH, gHome.a);      DrawRectangle(20, 0, 10, BH, gHome.b);
-    DrawRectangle(BW-20, 0, 20, BH, gAway.a);  DrawRectangle(BW-30, 0, 10, BH, gAway.b);
-    const char *hd = "PENALTY SHOOTOUT";
-    DrawText(hd, BW/2 - MeasureText(hd, 24)/2, 12, 24, (Color){120,140,175,255});
+    Vector3 c = (Vector3){ 0.0f, BOARD_Y, BOARD_Z };
+    DrawCube((Vector3){-BOARD_HW-0.1f, 3.1f, c.z + 0.15f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
+    DrawCube((Vector3){ BOARD_HW+0.1f, 3.1f, c.z + 0.15f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
+    DrawCube(c, BOARD_HW*2+0.6f, BOARD_HH*2+0.6f, 0.22f, (Color){26,28,36,255});                  // bezel
+    DrawCube((Vector3){0, c.y, c.z - 0.05f}, BOARD_HW*2, BOARD_HH*2, 0.08f, (Color){8,9,14,255}); // dark screen
+}
+static void DrawBoardOverlay(void)   // project the board rect + render the live match in an era style
+{
+    Vector2 tl = GetWorldToScreen((Vector3){ -BOARD_HW, BOARD_Y+BOARD_HH, BOARD_Z-0.1f }, g.cam);
+    Vector2 br = GetWorldToScreen((Vector3){  BOARD_HW, BOARD_Y-BOARD_HH, BOARD_Z-0.1f }, g.cam);
+    Rectangle rect = { tl.x, tl.y, br.x - tl.x, br.y - tl.y };
+    if (rect.width < 40 || rect.height < 18) return;
+
+    BoardData bd = (BoardData){0};
+    bd.era = gEra; bd.year = ERA_YEARS[gEra]; bd.title = "PENALTY SHOOTOUT";
     if (g.phase == PHASE_FLY && g.resolved) {
-        const char *rw = g.result==RES_GOAL?"GOAL!":g.result==RES_SAVE?"SAVED!":g.result==RES_POST?"WOODWORK!":"MISS!";
-        Color rc = g.result==RES_GOAL?(Color){90,220,120,255}:(Color){235,90,90,255};
-        DrawText(rw, BW/2 - MeasureText(rw, 46)/2, 50, 46, rc);
+        bd.big = g.result==RES_GOAL?"GOAL!":g.result==RES_SAVE?"SAVED!":g.result==RES_POST?"WOODWORK!":"MISS!";
+        bd.bigColor = g.result==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255};
     } else if (g.phase == PHASE_RESULT) {
-        const char *ft = TextFormat("FULL TIME    %d / %d", g.scored, KICKS_TOTAL);
-        DrawText(ft, BW/2 - MeasureText(ft, 38)/2, 54, 38, RAYWHITE);
-    } else {
-        const char *sc = TextFormat("SCORED  %d", g.scored);
-        DrawText(sc, BW/2 - MeasureText(sc, 40)/2, 52, 40, RAYWHITE);
-    }
-    int gap = 40, tot = (KICKS_TOTAL-1)*gap, sx = BW/2 - tot/2, dy = 132;
+        bd.title = "FULL TIME"; bd.big = TextFormat("%d / %d", g.scored, KICKS_TOTAL); bd.bigColor = RAYWHITE;
+    } else { bd.big = TextFormat("SCORED  %d", g.scored); bd.bigColor = RAYWHITE; }
+    bd.homeA = gHome.a; bd.homeB = gHome.b; bd.awayA = gAway.a; bd.awayB = gAway.b;
+    bd.dots = KICKS_TOTAL;
     for (int i = 0; i < KICKS_TOTAL; i++) {
-        int x = sx + i*gap;
         bool played = i < g.kick || (i == g.kick && g.resolved);
         Result rr = (i < g.kick) ? g.kickRes[i] : g.result;
-        Color dc = played ? (rr==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255}) : (Color){55,60,72,255};
-        DrawCircle(x, dy, 10, dc);
-        if (!played) DrawCircleLines(x, dy, 10, (Color){95,100,115,255});
+        bd.dotState[i] = played ? (rr==RES_GOAL ? 1 : 2) : 0;
     }
-    EndTextureMode();
-}
-static void DrawScoreboard(void)
-{
-    Vector3 c = (Vector3){ 0.0f, 6.2f, GOAL_Z + 8.0f };
-    DrawCube((Vector3){-6.1f, 3.1f, c.z + 0.12f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
-    DrawCube((Vector3){ 6.1f, 3.1f, c.z + 0.12f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
-    DrawCube((Vector3){0, c.y, c.z + 0.14f}, 12.6f, 4.1f, 0.25f, (Color){22,24,32,255});
-    DrawBillboardRec(g.cam, gBoard.texture,
-        (Rectangle){ 0, 0, (float)gBoard.texture.width, -(float)gBoard.texture.height },
-        c, (Vector2){ 12.0f, 3.75f }, WHITE);
+    DrawJumbotron(rect, bd, GetTime());
 }
 static void DrawStadium(void)
 {
@@ -615,7 +612,6 @@ static void UpdateDrawFrame(void)
     }
 
     // ---- draw ----
-    RenderBoard();
     int W = GetScreenWidth(), H = GetScreenHeight();
     BeginDrawing();
     ClearBackground((Color){ 20, 24, 32, 255 });
@@ -649,6 +645,8 @@ static void UpdateDrawFrame(void)
         }
     EndMode3D();
 
+    DrawBoardOverlay();
+
     // ---- minimal HUD — the match now lives on the jumbotron ----
     int f = (int)Clamp(H*0.030f, 13.0f, 24.0f);
     int mg = (int)(H*0.035f);
@@ -671,7 +669,6 @@ int main(void)
 {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(900, 600, "Arcade - World Cup Penalty");
-    gBoard = LoadRenderTexture(512, 160);
 
     g.cam = (Camera3D){0};
     g.cam.position   = (Vector3){ 0.0f, 2.6f, -6.5f };
@@ -688,7 +685,6 @@ int main(void)
     SetTargetFPS(60);
     while (!WindowShouldClose()) UpdateDrawFrame();
 #endif
-    UnloadRenderTexture(gBoard);
     CloseWindow();
     return 0;
 }
