@@ -26,8 +26,7 @@ emcc -o "$ROOT/dist/$GAME/index.html" \
   -DPLATFORM_WEB \
   -s USE_GLFW=3 \
   -s ASYNCIFY \
-  -s ALLOW_MEMORY_GROWTH=1 \
-  -s FORCE_FILESYSTEM=1 \
+  -s INITIAL_MEMORY=67108864 \
   --shell-file "$ROOT/web/shell.html" \
   -O2
 
