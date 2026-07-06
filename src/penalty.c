@@ -61,6 +61,10 @@ typedef struct {
     Result  result;
     bool    resolved, caught, hitWood;
     float   resultTimer, celebrate, flight;
+    // touch / swipe input
+    bool    swipeActive;
+    Vector2 swipeStart, swipePrev, swipeDir;
+    float   swipeBend;
     Camera3D cam;
 } Game;
 
@@ -484,6 +488,20 @@ static void KeeperReact(float dt)
     }
 }
 
+// ---- touch / swipe input ------------------------------------------------
+// direction aims (left/right + height), length = power, arc of the swipe = curl.
+static void SwipeToAim(Vector2 start, Vector2 cur, float bend)
+{
+    float W = (float)GetScreenWidth(), H = (float)GetScreenHeight();
+    float dx = cur.x - start.x, ddy = cur.y - start.y;
+    float len = sqrtf(dx*dx + ddy*ddy);
+    float up = (len > 1.0f) ? (-ddy / len) : 1.0f;          // 1 = swiped straight up the screen
+    g.yaw     = Clamp(dx / (W*0.30f) * 0.42f, -0.42f, 0.42f);
+    g.power01 = Clamp(len / (H*0.55f), 0.15f, 1.0f);
+    g.pitch   = Clamp(0.08f + up*0.30f, 0.04f, 0.52f);
+    g.curve   = Clamp(-bend * 0.9f, -1.0f, 1.0f);
+}
+
 // ---- main frame ---------------------------------------------------------
 static void UpdateDrawFrame(void)
 {
@@ -502,6 +520,35 @@ static void UpdateDrawFrame(void)
         g.pitch = Clamp(g.pitch, 0.02f, 0.55f);
         if (IsKeyDown(KEY_A)) g.curve = Clamp(g.curve - 1.4f*dt, -1.0f, 1.0f);
         if (IsKeyDown(KEY_D)) g.curve = Clamp(g.curve + 1.4f*dt, -1.0f, 1.0f);
+
+        // touch / mouse: swipe to shoot
+        Vector2 m = GetMousePosition();
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            g.swipeActive = true; g.swipeStart = m; g.swipePrev = m;
+            g.swipeDir = (Vector2){0,0}; g.swipeBend = 0.0f;
+        }
+        if (g.swipeActive && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Vector2 d = { m.x - g.swipePrev.x, m.y - g.swipePrev.y };
+            float dl = sqrtf(d.x*d.x + d.y*d.y);
+            if (dl > 6.0f) {                                    // accumulate the swipe's bend (for curl)
+                Vector2 nd = { d.x/dl, d.y/dl };
+                if (g.swipeDir.x != 0.0f || g.swipeDir.y != 0.0f)
+                    g.swipeBend += g.swipeDir.x*nd.y - g.swipeDir.y*nd.x;
+                g.swipeDir = nd; g.swipePrev = m;
+            }
+            SwipeToAim(g.swipeStart, m, g.swipeBend);           // live preview (red arc follows)
+        }
+        if (g.swipeActive && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            g.swipeActive = false;
+            Vector2 v = { m.x - g.swipeStart.x, m.y - g.swipeStart.y };
+            if (sqrtf(v.x*v.x + v.y*v.y) > 40.0f) {             // a real swipe -> strike
+                SwipeToAim(g.swipeStart, m, g.swipeBend);
+                g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
+                CommitKeeperDive();
+                g.phase = PHASE_FLY;
+            }
+        }
+
         if (IsKeyPressed(KEY_SPACE)) { g.phase = PHASE_CHARGE; g.power01 = 0.0f; g.chargeDir = 1.0f; }
     } break;
 
@@ -541,7 +588,7 @@ static void UpdateDrawFrame(void)
     case PHASE_RESULT:
         StepNet(dt);
         KeeperReact(dt);
-        if (IsKeyPressed(KEY_ENTER)) ResetMatch();
+        if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ResetMatch();
         break;
     }
 
@@ -591,7 +638,8 @@ static void UpdateDrawFrame(void)
              20, 50, 20, (Color){ 200, 210, 220, 255 });
 
     if (g.phase == PHASE_AIM)
-        DrawText("Arrows: aim    A/D: curl    SPACE: charge", 20, GetScreenHeight()-34, 20, RAYWHITE);
+        DrawText("Swipe to shoot  —  aim by direction, arc it to curl   (or arrows + SPACE)",
+                 20, GetScreenHeight()-34, 18, RAYWHITE);
     if (g.phase == PHASE_CHARGE) {
         DrawText("Release SPACE to strike   (more power = less accurate)", 20, GetScreenHeight()-34, 18, RAYWHITE);
         DrawRectangle(20, GetScreenHeight()-70, 300, 22, (Color){0,0,0,120});
