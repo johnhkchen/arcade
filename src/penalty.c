@@ -54,7 +54,7 @@ typedef struct {
     float   reactT;
     // flow
     int     kick, scored;
-    Result  result;
+    Result  result, kickRes[KICKS_TOTAL];
     bool    resolved, caught, hitWood;
     float   resultTimer, celebrate, flight;
     // touch input
@@ -75,16 +75,7 @@ static const Team TEAMS[] = {
     {{0,90,160,255},{240,220,40,255}},   {{150,20,50,255},{240,240,240,255}},
 };
 static Team gHome, gAway;
-static const char *MOMENTS[] = {
-    "1994 FINAL  -  Baggio skies the decider",
-    "2006  -  Zidane's cheeky Panenka",
-    "1990  -  Argentina hold their nerve",
-    "2018  -  England finally win a shootout",
-    "1982  -  the first World Cup shootout",
-    "2022 FINAL  -  Argentina prevail on pens",
-    "2006 FINAL  -  Italy, champions on pens",
-    "1994 FINAL  -  Baresi & Massaro denied",
-};
+static RenderTexture2D gBoard;   // the jumbotron's live screen
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
@@ -350,6 +341,7 @@ static void ResetMatch(void)
     int hi = GetRandomValue(0, n-1), ai = GetRandomValue(0, n-2);
     if (ai >= hi) ai++;                                  // distinct matchup
     gHome = TEAMS[hi]; gAway = TEAMS[ai];
+    for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
     g.kick = 0; g.scored = 0; g.celebrate = 0.0f; StartKick();
 }
 
@@ -374,6 +366,7 @@ static void CommitKeeperDive(void)
 static void Resolve(Result r)
 {
     g.result = r; g.resolved = true; g.resultTimer = 0.0f;
+    if (g.kick < KICKS_TOTAL) g.kickRes[g.kick] = r;
     if (r == RES_GOAL) { g.scored++; g.celebrate = 1.7f; }
     g.reactAnim = GetRandomValue(0, 4);
     g.reactCelebrate = (r != RES_GOAL);
@@ -466,13 +459,47 @@ static Color FanColor(float x, int h)
     if (m == 0) return (Color){235,235,235,255};
     return (m <= 2) ? tm.a : tm.b;
 }
+// render the live match onto the jumbotron texture (call before BeginDrawing)
+static void RenderBoard(void)
+{
+    const int BW = 512, BH = 160;
+    BeginTextureMode(gBoard);
+    ClearBackground((Color){ 14, 16, 24, 255 });
+    DrawRectangle(0, 0, 20, BH, gHome.a);      DrawRectangle(20, 0, 10, BH, gHome.b);
+    DrawRectangle(BW-20, 0, 20, BH, gAway.a);  DrawRectangle(BW-30, 0, 10, BH, gAway.b);
+    const char *hd = "PENALTY SHOOTOUT";
+    DrawText(hd, BW/2 - MeasureText(hd, 24)/2, 12, 24, (Color){120,140,175,255});
+    if (g.phase == PHASE_FLY && g.resolved) {
+        const char *rw = g.result==RES_GOAL?"GOAL!":g.result==RES_SAVE?"SAVED!":g.result==RES_POST?"WOODWORK!":"MISS!";
+        Color rc = g.result==RES_GOAL?(Color){90,220,120,255}:(Color){235,90,90,255};
+        DrawText(rw, BW/2 - MeasureText(rw, 46)/2, 50, 46, rc);
+    } else if (g.phase == PHASE_RESULT) {
+        const char *ft = TextFormat("FULL TIME    %d / %d", g.scored, KICKS_TOTAL);
+        DrawText(ft, BW/2 - MeasureText(ft, 38)/2, 54, 38, RAYWHITE);
+    } else {
+        const char *sc = TextFormat("SCORED  %d", g.scored);
+        DrawText(sc, BW/2 - MeasureText(sc, 40)/2, 52, 40, RAYWHITE);
+    }
+    int gap = 40, tot = (KICKS_TOTAL-1)*gap, sx = BW/2 - tot/2, dy = 132;
+    for (int i = 0; i < KICKS_TOTAL; i++) {
+        int x = sx + i*gap;
+        bool played = i < g.kick || (i == g.kick && g.resolved);
+        Result rr = (i < g.kick) ? g.kickRes[i] : g.result;
+        Color dc = played ? (rr==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255}) : (Color){55,60,72,255};
+        DrawCircle(x, dy, 10, dc);
+        if (!played) DrawCircleLines(x, dy, 10, (Color){95,100,115,255});
+    }
+    EndTextureMode();
+}
 static void DrawScoreboard(void)
 {
     Vector3 c = (Vector3){ 0.0f, 6.2f, GOAL_Z + 8.0f };
-    DrawCube((Vector3){-5.5f, 3.1f, c.z}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});   // supports
-    DrawCube((Vector3){ 5.5f, 3.1f, c.z}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
-    DrawCube(c, 12.0f, 3.4f, 0.4f, (Color){ 15, 17, 25, 255 });                        // screen
-    DrawCubeWires(c, 12.0f, 3.4f, 0.4f, (Color){ 90, 100, 120, 255 });
+    DrawCube((Vector3){-6.1f, 3.1f, c.z + 0.12f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
+    DrawCube((Vector3){ 6.1f, 3.1f, c.z + 0.12f}, 0.3f, 6.2f, 0.3f, (Color){40,42,50,255});
+    DrawCube((Vector3){0, c.y, c.z + 0.14f}, 12.6f, 4.1f, 0.25f, (Color){22,24,32,255});
+    DrawBillboardRec(g.cam, gBoard.texture,
+        (Rectangle){ 0, 0, (float)gBoard.texture.width, -(float)gBoard.texture.height },
+        c, (Vector2){ 12.0f, 3.75f }, WHITE);
 }
 static void DrawStadium(void)
 {
@@ -588,6 +615,7 @@ static void UpdateDrawFrame(void)
     }
 
     // ---- draw ----
+    RenderBoard();
     int W = GetScreenWidth(), H = GetScreenHeight();
     BeginDrawing();
     ClearBackground((Color){ 20, 24, 32, 255 });
@@ -621,38 +649,20 @@ static void UpdateDrawFrame(void)
         }
     EndMode3D();
 
-    // ---- HUD ----
-    DrawText("WORLD CUP PENALTY", 20, 16, 28, RAYWHITE);
-    DrawText(TextFormat("Kick %d / %d     Scored %d", (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
-             20, 50, 20, (Color){ 200, 210, 220, 255 });
-    {   // famous-moment caption projected onto the scoreboard
-        Vector2 sp = GetWorldToScreen((Vector3){ 0.0f, 6.2f, GOAL_Z + 8.0f }, g.cam);
-        int idx = ((int)(GetTime() / 4.0)) % (int)(sizeof(MOMENTS)/sizeof(MOMENTS[0]));
-        if (sp.y > -40.0f && sp.y < H && sp.x > -240.0f && sp.x < W + 240.0f) {
-            const char *hdr = "WORLD CUP PENALTIES";
-            int hw = MeasureText(hdr, 16), cw = MeasureText(MOMENTS[idx], 20);
-            DrawText(hdr, (int)sp.x - hw/2, (int)sp.y - 24, 16, (Color){110,135,175,255});
-            DrawText(MOMENTS[idx], (int)sp.x - cw/2, (int)sp.y, 20, (Color){235,240,245,255});
-        }
-    }
-    if (g.phase == PHASE_AIM)
-        DrawText("Touch to aim, hold to charge power, drag to curl  (or arrows + SPACE)", 20, H-34, 18, RAYWHITE);
+    // ---- minimal HUD — the match now lives on the jumbotron ----
+    int f = (int)Clamp(H*0.030f, 13.0f, 24.0f);
+    int mg = (int)(H*0.035f);
     if (g.phase == PHASE_CHARGE) {
-        DrawText("Release to strike   ·   drag left/right to curl", 20, H-34, 18, RAYWHITE);
-        DrawRectangle(20, H-70, 300, 22, (Color){0,0,0,120});
-        DrawRectangle(20, H-70, (int)(300*g.power01), 22, (Color){ 90, 200, 120, 255 });
-    }
-    if (g.phase == PHASE_FLY && g.resolved) {
-        const char *msg = g.result==RES_GOAL ? "GOAL!" : g.result==RES_SAVE ? "SAVED!" : g.result==RES_POST ? "OFF THE WOODWORK!" : "MISS!";
-        Color c = g.result==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255};
-        int fs = 56, tw = MeasureText(msg, fs);
-        DrawText(msg, W/2 - tw/2, 92, fs, c);
-    }
-    if (g.phase == PHASE_RESULT) {
-        const char *mm = TextFormat("FULL TIME   Scored %d / %d", g.scored, KICKS_TOTAL);
-        int tw = MeasureText(mm, 40);
-        DrawText(mm, W/2 - tw/2, 96, 40, RAYWHITE);
-        DrawText("Tap / ENTER to play again", W/2 - 130, 160, 20, (Color){200,210,220,255});
+        int bw = (int)(W*0.42f), bh = (int)(f*1.1f), bx = W/2 - bw/2, by = H - mg - bh;
+        DrawRectangle(bx, by, bw, bh, (Color){0,0,0,120});
+        DrawRectangle(bx, by, (int)(bw*g.power01), bh, (Color){90,200,120,255});
+    } else {
+        const char *hint = (g.phase == PHASE_RESULT) ? "Tap to play again"
+                         : (g.phase == PHASE_AIM)    ? "Hold & aim, release to shoot  ·  drag to curl" : "";
+        if (hint[0]) {
+            int fs = f; while (fs > 10 && MeasureText(hint, fs) > W - 2*mg) fs--;
+            DrawText(hint, W/2 - MeasureText(hint, fs)/2, H - mg - fs, fs, (Color){210,216,224,220});
+        }
     }
     EndDrawing();
 }
@@ -661,6 +671,7 @@ int main(void)
 {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(900, 600, "Arcade - World Cup Penalty");
+    gBoard = LoadRenderTexture(512, 160);
 
     g.cam = (Camera3D){0};
     g.cam.position   = (Vector3){ 0.0f, 2.6f, -6.5f };
@@ -677,6 +688,7 @@ int main(void)
     SetTargetFPS(60);
     while (!WindowShouldClose()) UpdateDrawFrame();
 #endif
+    UnloadRenderTexture(gBoard);
     CloseWindow();
     return 0;
 }
