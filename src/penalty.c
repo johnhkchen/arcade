@@ -1,113 +1,185 @@
 // penalty.c — Arcade cartridge #1: World Cup Penalty Shootout.
-// Skin #1 over the shared ballstrike core: aim + charge power + curl, beat the keeper.
+// Skin #1 over the shared ballstrike core.
 //
-// Flow per kick:  AIM (move reticle, A/D to set curl) -> hold SPACE to charge power,
-// release to strike -> ball flies (ballstrike) -> GOAL / SAVE / MISS -> next kick.
-// Five kicks, running tally. Keeper guesses a side at strike time (deliberately dumb —
-// the fun is the skill shot, not a "realistic" AI).
+// Physics, not heuristics: the ball is a sphere that collides with a *diving*
+// keeper (reaction delay + finite dive speed + limited reach) and with the
+// posts/bar; the kick trades power against accuracy and curls with real
+// sidespin. The keeper's DECISION stays dumb (a guess with error) — only its
+// MOTION is physical, so a well-placed shot beats it by geometry, not luck.
+//
+// Flow per kick: AIM (arrows aim, A/D set curl) -> hold SPACE to charge power,
+// release to strike -> ball flies & collides -> GOAL / SAVE / POST / MISS.
+// Five kicks, running tally.
 #include "raylib.h"
 #include "raymath.h"
 #include "ballstrike.h"
 #include <math.h>
-#include <stdio.h>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
 #endif
 
-// --- field constants (metres) ---
-#define GOAL_Z        18.0f
-#define GOAL_HALF_W    3.66f   // half of a 7.32m goal
-#define GOAL_H         2.44f
-#define BALL_R         0.11f
-#define KICKS_TOTAL    5
+#define GOAL_Z         18.0f
+#define GOAL_HALF_W     3.66f   // half of a 7.32m goal
+#define GOAL_H          2.44f
+#define BALL_R          0.11f
+#define POST_R          0.06f
+#define KICKS_TOTAL     5
+
+// keeper
+#define KPR_REACH       1.15f   // body+arm reach radius
+#define KPR_DIVE_SPEED  8.5f     // m/s, finite — this is what makes corners score
+#define KPR_ACCEL      55.0f
+#define KPR_HOME_Y      1.05f
 
 typedef enum { PHASE_AIM, PHASE_CHARGE, PHASE_FLY, PHASE_RESULT } Phase;
-typedef enum { RES_NONE, RES_GOAL, RES_SAVE, RES_MISS } Result;
+typedef enum { RES_NONE, RES_GOAL, RES_SAVE, RES_POST, RES_MISS } Result;
 
 typedef struct {
-    Phase  phase;
-    float  yaw;        // aim
-    float  pitch;
-    float  curve;      // -1..1
-    float  power01;    // charge meter 0..1
-    float  chargeDir;  // meter oscillation direction
-    Ball   ball;
-    // keeper
-    float  keeperX;      // current x
-    float  keeperTargetX;
-    float  keeperY;      // dive height
+    Phase   phase;
+    float   yaw, pitch, curve;     // aim + curl input
+    float   power01, chargeDir;    // charge meter
+    Ball    ball;
+    // keeper (physical dive)
+    Vector3 kprPos, kprVel;
+    float   kprReact;              // reaction countdown before it can move
+    float   kprDiveX, kprDiveH;    // chosen dive target (a guess, with error)
     // scoring
-    int    kick;         // 0-based
-    int    scored;
-    Result result;
-    float  resultTimer;
+    int     kick, scored;
+    Result  result;
+    float   resultTimer;
     Camera3D cam;
 } Game;
 
 static Game g;
 
+static float Frand(void) { return GetRandomValue(0, 1000) / 1000.0f; }   // 0..1
+static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }             // -1..1
+
+static void ResetKeeper(void)
+{
+    g.kprPos = (Vector3){ 0.0f, KPR_HOME_Y, GOAL_Z - 0.5f };
+    g.kprVel = (Vector3){0};
+    g.kprReact = 0.0f;
+    g.kprDiveX = 0.0f;
+    g.kprDiveH = KPR_HOME_Y;
+}
+
 static void StartKick(void)
 {
     g.phase = PHASE_AIM;
-    g.yaw = 0.0f;
-    g.pitch = 0.18f;
-    g.curve = 0.0f;
-    g.power01 = 0.0f;
-    g.chargeDir = 1.0f;
+    g.yaw = 0.0f; g.pitch = 0.16f; g.curve = 0.0f;
+    g.power01 = 0.0f; g.chargeDir = 1.0f;
     g.ball = (Ball){0};
     g.ball.pos = (Vector3){0.0f, BALL_R, 0.0f};
-    g.keeperX = 0.0f;
-    g.keeperTargetX = 0.0f;
-    g.keeperY = 0.0f;
+    ResetKeeper();
     g.result = RES_NONE;
     g.resultTimer = 0.0f;
 }
 
-static void ResetMatch(void)
+static void ResetMatch(void) { g.kick = 0; g.scored = 0; StartKick(); }
+
+static Strike AimStrike(void)  // the strike the current aim/power would produce
 {
-    g.kick = 0;
-    g.scored = 0;
-    StartKick();
+    // Power trades against accuracy: a harder shot scatters more.
+    float scatter = g.power01 * 0.05f;
+    return (Strike){
+        .power = 13.0f + g.power01 * 16.0f,
+        .yaw   = g.yaw   + Frand2() * scatter,
+        .pitch = g.pitch + Frand2() * scatter * 0.6f,
+        .curve = g.curve * 3.0f,
+    };
 }
 
-// deterministic-ish keeper guess without pulling in rand seeding fuss
-static float KeeperGuess(void)
+// Roughly where will the ball cross the goal plane? (keeper's imperfect read)
+static void PredictCrossing(float *px, float *py)
 {
-    // pseudo guess based on kick index + a time wobble; dumb on purpose
-    float r = sinf((float)g.kick * 12.9898f + GetTime() * 0.37f) * 43758.5453f;
-    r = r - floorf(r);            // 0..1
-    return (r - 0.5f) * 2.0f * (GOAL_HALF_W * 0.9f);  // -x..x
+    Ball p = g.ball;
+    for (int i = 0; i < 500 && p.pos.z < GOAL_Z; i++) BallStep(&p, 0.01f);
+    *px = p.pos.x; *py = p.pos.y;
 }
 
-static void Judge(void)
+static void CommitKeeperDive(void)
 {
-    // ball has crossed the goal plane; classify by where.
-    float x = g.ball.pos.x;
-    float y = g.ball.pos.y;
+    float px, py; PredictCrossing(&px, &py);
+    // dumb read: partial confidence + error, sometimes wrong-footed entirely
+    float err = Frand2() * 1.6f;
+    if (Frand() < 0.15f) err += (px > 0 ? -1.0f : 1.0f) * 2.5f;   // occasional wrong guess
+    g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
+    g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
+    g.kprReact = 0.12f + Frand() * 0.10f;
+    g.kprVel = (Vector3){0};
+}
 
-    bool insidePosts = (fabsf(x) < GOAL_HALF_W) && (y > 0.0f) && (y < GOAL_H);
-    if (!insidePosts) { g.result = RES_MISS; return; }
+static void StepKeeper(float dt)
+{
+    if (g.kprReact > 0.0f) { g.kprReact -= dt; return; }
+    Vector3 target = (Vector3){ g.kprDiveX, g.kprDiveH, GOAL_Z - 0.45f };
+    Vector3 to = Vector3Subtract(target, g.kprPos);
+    if (Vector3Length(to) > 0.02f)
+        g.kprVel = Vector3Add(g.kprVel, Vector3Scale(Vector3Normalize(to), KPR_ACCEL * dt));
+    float sp = Vector3Length(g.kprVel);
+    if (sp > KPR_DIVE_SPEED) g.kprVel = Vector3Scale(g.kprVel, KPR_DIVE_SPEED / sp);
+    g.kprVel.y -= 3.5f * dt;                                    // the dive arcs down
+    g.kprPos = Vector3Add(g.kprPos, Vector3Scale(g.kprVel, dt));
+    if (g.kprPos.y < 0.45f) { g.kprPos.y = 0.45f; g.kprVel.y = 0.0f; }
+}
 
-    // keeper covers a reach around its dive point
-    float reachW = 1.35f;
-    float reachH = 2.15f;
-    bool covered = (fabsf(x - g.keeperTargetX) < reachW) && (y < reachH);
-    g.result = covered ? RES_SAVE : RES_GOAL;
+// advance ball with collisions; sets g.result when the shot resolves
+static void StepBall(float dt)
+{
+    const int N = 8;
+    for (int i = 0; i < N && g.result == RES_NONE; i++) {
+        BallStep(&g.ball, dt / N);
+        Vector3 p = g.ball.pos;
+
+        // keeper parry (only near the line)
+        if (p.z > GOAL_Z - 2.2f && Vector3Distance(p, g.kprPos) < BALL_R + KPR_REACH) {
+            Vector3 n = Vector3Normalize(Vector3Subtract(p, g.kprPos));
+            g.ball.vel = Vector3Scale(Vector3Reflect(g.ball.vel, n), 0.45f);
+            g.result = RES_SAVE;
+            break;
+        }
+        // posts & crossbar
+        if (p.z >= GOAL_Z - 0.12f && p.z <= GOAL_Z + 0.2f) {
+            bool hitPost = (fabsf(fabsf(p.x) - GOAL_HALF_W) < BALL_R + POST_R) && p.y > 0 && p.y < GOAL_H + 0.1f;
+            bool hitBar  = (fabsf(p.y - GOAL_H) < BALL_R + POST_R) && fabsf(p.x) < GOAL_HALF_W;
+            if (hitPost || hitBar) { g.result = RES_POST; break; }
+        }
+        // goal line
+        if (p.z >= GOAL_Z) {
+            bool in = fabsf(p.x) < GOAL_HALF_W && p.y > 0 && p.y < GOAL_H;
+            g.result = in ? RES_GOAL : RES_MISS;
+            break;
+        }
+        // turf
+        if (p.y < BALL_R) { g.ball.pos.y = BALL_R; g.ball.vel.y *= -0.45f; g.ball.vel.x *= 0.8f; g.ball.vel.z *= 0.85f; }
+    }
+    // rolled to a stop short of goal
+    if (g.result == RES_NONE && g.ball.pos.z < GOAL_Z - 0.5f && Vector3Length(g.ball.vel) < 1.5f)
+        g.result = RES_MISS;
+}
+
+static void ResolveResult(void)
+{
     if (g.result == RES_GOAL) g.scored++;
+    g.ball.live = false;
+    g.phase = PHASE_RESULT;
+    g.resultTimer = 0.0f;
 }
 
 static void UpdateDrawFrame(void)
 {
     float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f;   // clamp big hitches (tab refocus)
 
     switch (g.phase) {
     case PHASE_AIM: {
-        float aimSpd = 0.9f * dt;
-        if (IsKeyDown(KEY_LEFT))  g.yaw  -= aimSpd;
-        if (IsKeyDown(KEY_RIGHT)) g.yaw  += aimSpd;
-        if (IsKeyDown(KEY_UP))    g.pitch += aimSpd;
-        if (IsKeyDown(KEY_DOWN))  g.pitch -= aimSpd;
+        float s = 0.9f * dt;
+        if (IsKeyDown(KEY_LEFT))  g.yaw   -= s;
+        if (IsKeyDown(KEY_RIGHT)) g.yaw   += s;
+        if (IsKeyDown(KEY_UP))    g.pitch += s;
+        if (IsKeyDown(KEY_DOWN))  g.pitch -= s;
         g.yaw = Clamp(g.yaw, -0.42f, 0.42f);
         g.pitch = Clamp(g.pitch, 0.02f, 0.55f);
         if (IsKeyDown(KEY_A)) g.curve = Clamp(g.curve - 1.4f*dt, -1.0f, 1.0f);
@@ -120,31 +192,21 @@ static void UpdateDrawFrame(void)
         if (g.power01 >= 1.0f) { g.power01 = 1.0f; g.chargeDir = -1.0f; }
         if (g.power01 <= 0.0f) { g.power01 = 0.0f; g.chargeDir =  1.0f; }
         if (IsKeyReleased(KEY_SPACE) || IsKeyPressed(KEY_SPACE)) {
-            Strike s = {
-                .power = 13.0f + g.power01 * 15.0f,
-                .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve * 3.2f
-            };
-            g.ball = BallLaunch((Vector3){0, BALL_R, 0}, s);
-            g.keeperTargetX = KeeperGuess();
+            g.ball = BallLaunch((Vector3){0, BALL_R, 0}, AimStrike());
+            CommitKeeperDive();
             g.phase = PHASE_FLY;
         }
     } break;
 
     case PHASE_FLY: {
-        for (int i = 0; i < 4; i++) BallStep(&g.ball, dt / 4.0f);  // sub-steps
-        // keeper dives toward its guess
-        g.keeperX = Lerp(g.keeperX, g.keeperTargetX, 6.0f * dt);
-        g.keeperY = Lerp(g.keeperY, (fabsf(g.keeperTargetX) > 0.6f) ? 1.4f : 0.4f, 5.0f * dt);
-        if (g.ball.pos.z >= GOAL_Z) { g.ball.live = false; Judge(); g.phase = PHASE_RESULT; g.resultTimer = 0.0f; }
-        else if (g.ball.pos.y < BALL_R && g.ball.vel.y < 0) { // hit turf short
-            g.ball.pos.y = BALL_R; g.ball.vel.y *= -0.4f; g.ball.vel = Vector3Scale(g.ball.vel, 0.7f);
-            if (Vector3Length(g.ball.vel) < 2.0f) { g.result = RES_MISS; g.phase = PHASE_RESULT; g.resultTimer = 0; }
-        }
+        StepKeeper(dt);
+        StepBall(dt);
+        if (g.result != RES_NONE) ResolveResult();
     } break;
 
     case PHASE_RESULT: {
         g.resultTimer += dt;
-        if (g.resultTimer > 1.6f) {
+        if (g.resultTimer > 1.7f) {
             g.kick++;
             if (g.kick >= KICKS_TOTAL) { if (IsKeyPressed(KEY_ENTER)) ResetMatch(); }
             else StartKick();
@@ -152,58 +214,58 @@ static void UpdateDrawFrame(void)
     } break;
     }
 
-    // --- draw ---
+    // ---- draw ----
     BeginDrawing();
     ClearBackground((Color){ 22, 26, 34, 255 });
 
     BeginMode3D(g.cam);
-        DrawPlane((Vector3){0, 0, 9}, (Vector2){40, 30}, (Color){ 34, 78, 46, 255 });   // pitch
-        // penalty spot
-        DrawCircle3D((Vector3){0, 0.01f, 0}, 0.25f, (Vector3){1,0,0}, 90.0f, RAYWHITE);
+        DrawPlane((Vector3){0, 0, 9}, (Vector2){40, 30}, (Color){ 34, 78, 46, 255 });
+        DrawCircle3D((Vector3){0, 0.01f, 0}, 0.22f, (Vector3){1,0,0}, 90.0f, RAYWHITE);
         // goal frame
-        Color post = RAYWHITE;
-        DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, 0.12f, GOAL_H, 0.12f, post);
-        DrawCube((Vector3){ GOAL_HALF_W, GOAL_H/2, GOAL_Z}, 0.12f, GOAL_H, 0.12f, post);
-        DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, 0.12f, 0.12f, post);
-        // net hint
+        DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
+        DrawCube((Vector3){ GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
+        DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         for (int i = -3; i <= 3; i++)
-            DrawLine3D((Vector3){i*GOAL_HALF_W/3, 0, GOAL_Z}, (Vector3){i*GOAL_HALF_W/3, GOAL_H, GOAL_Z}, (Color){200,200,200,90});
-        // keeper
-        DrawCube((Vector3){g.keeperX, 0.9f + g.keeperY, GOAL_Z - 0.6f}, 0.7f, 1.8f, 0.4f, (Color){ 240, 190, 40, 255 });
+            DrawLine3D((Vector3){i*GOAL_HALF_W/3, 0, GOAL_Z}, (Vector3){i*GOAL_HALF_W/3, GOAL_H, GOAL_Z}, (Color){200,200,200,80});
+        // keeper: body + reach hint
+        DrawCube(g.kprPos, 0.55f, 1.05f, 0.4f, (Color){ 240, 190, 40, 255 });
+        DrawSphereWires(g.kprPos, KPR_REACH, 6, 6, (Color){ 240, 190, 40, 45 });
         // ball
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
-        // aim tracer while aiming/charging
+        // predicted path while aiming
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
-            Strike s = { .power = 20, .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve*3.2f };
+            Strike s = { .power = 13.0f + g.power01*16.0f, .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve*3.0f };
             Ball t = BallLaunch((Vector3){0, BALL_R, 0}, s);
             Vector3 prev = t.pos;
-            for (int i = 0; i < 40 && t.pos.z < GOAL_Z + 1; i++) {
-                BallStep(&t, 0.04f);
-                DrawLine3D(prev, t.pos, (Color){ 255, 90, 90, 160 });
+            for (int i = 0; i < 60 && t.pos.z < GOAL_Z + 1; i++) {
+                BallStep(&t, 0.03f);
+                DrawLine3D(prev, t.pos, (Color){ 255, 90, 90, 150 });
                 prev = t.pos;
             }
         }
     EndMode3D();
 
-    // --- HUD ---
+    // ---- HUD ----
     DrawText("WORLD CUP PENALTY", 20, 16, 28, RAYWHITE);
-    DrawText(TextFormat("Kick %d / %d     Scored %d", (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
+    DrawText(TextFormat("Kick %d / %d     Scored %d",
+             (g.kick < KICKS_TOTAL ? g.kick+1 : KICKS_TOTAL), KICKS_TOTAL, g.scored),
              20, 50, 20, (Color){ 200, 210, 220, 255 });
 
     if (g.phase == PHASE_AIM)
-        DrawText("Arrows: aim   A/D: curl   SPACE: charge power", 20, GetScreenHeight()-34, 20, RAYWHITE);
+        DrawText("Arrows: aim    A/D: curl    SPACE: charge", 20, GetScreenHeight()-34, 20, RAYWHITE);
     if (g.phase == PHASE_CHARGE) {
-        DrawText("Release SPACE to strike!", 20, GetScreenHeight()-34, 20, RAYWHITE);
+        DrawText("Release SPACE to strike   (more power = less accurate)", 20, GetScreenHeight()-34, 18, RAYWHITE);
         DrawRectangle(20, GetScreenHeight()-70, 300, 22, (Color){0,0,0,120});
         DrawRectangle(20, GetScreenHeight()-70, (int)(300*g.power01), 22, (Color){ 90, 200, 120, 255 });
     }
     if (g.phase == PHASE_RESULT) {
-        const char *msg = g.result==RES_GOAL ? "GOAL!" : g.result==RES_SAVE ? "SAVED!" : "MISS!";
+        const char *msg = g.result==RES_GOAL ? "GOAL!" : g.result==RES_SAVE ? "SAVED!" :
+                          g.result==RES_POST ? "OFF THE WOODWORK!" : "MISS!";
         Color c = g.result==RES_GOAL ? (Color){90,220,120,255} : (Color){235,90,90,255};
-        int fs = 60; int w = MeasureText(msg, fs);
-        DrawText(msg, GetScreenWidth()/2 - w/2, 90, fs, c);
-        if (g.kick >= KICKS_TOTAL-1 && g.resultTimer > 1.6f)
-            DrawText("ENTER to play again", GetScreenWidth()/2 - 110, 170, 20, RAYWHITE);
+        int fs = 56; int w = MeasureText(msg, fs);
+        DrawText(msg, GetScreenWidth()/2 - w/2, 92, fs, c);
+        if (g.kick >= KICKS_TOTAL-1 && g.resultTimer > 1.7f)
+            DrawText("ENTER to play again", GetScreenWidth()/2 - 110, 168, 20, RAYWHITE);
     }
 
     EndDrawing();
@@ -211,14 +273,13 @@ static void UpdateDrawFrame(void)
 
 int main(void)
 {
-    const int W = 900, H = 600;
-    InitWindow(W, H, "Arcade — World Cup Penalty");
+    InitWindow(900, 600, "Arcade - World Cup Penalty");
 
     g.cam = (Camera3D){0};
-    g.cam.position = (Vector3){ 0.0f, 2.6f, -6.5f };
-    g.cam.target   = (Vector3){ 0.0f, 1.4f, GOAL_Z };
-    g.cam.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
-    g.cam.fovy     = 55.0f;
+    g.cam.position   = (Vector3){ 0.0f, 2.6f, -6.5f };
+    g.cam.target     = (Vector3){ 0.0f, 1.4f, GOAL_Z };
+    g.cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+    g.cam.fovy       = 55.0f;
     g.cam.projection = CAMERA_PERSPECTIVE;
 
     ResetMatch();
