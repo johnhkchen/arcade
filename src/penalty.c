@@ -52,7 +52,7 @@ typedef struct {
     float   kprReact, kprDiveX, kprDiveH;
     bool    kprLaunched;
     // keeper reaction (celebration / frustration)
-    Vector3 kprAxis, kprGL, kprGR, kprHeadOff, reactBase;
+    Vector3 kprAxis, kprGL, kprGR, kprGLv, kprGRv, kprHeadOff, reactBase;
     int     reactAnim;
     bool    reactCelebrate, reactOnGround, landed;
     float   reactT;
@@ -154,6 +154,10 @@ static void ResetKeeper(void)
     g.kprVel = (Vector3){0};
     g.kprReact = 0.0f; g.kprDiveX = 0.0f; g.kprDiveH = KPR_HOME_Y;
     g.kprLaunched = false;
+    g.kprAxis = (Vector3){0, 1, 0};
+    g.kprGL = GlovePos(-1); g.kprGR = GlovePos(+1);
+    g.kprGLv = (Vector3){0}; g.kprGRv = (Vector3){0};
+    g.kprHeadOff = (Vector3){0};
 }
 
 // one-time ballistic dive launch; capped so far/high corners can't be reached
@@ -381,8 +385,22 @@ static void DrawPitch(void)
     DrawCube((Vector3){0, 0.02f, 0}, 0.22f, 0.03f, 0.22f, (Color){235,238,240,220}); // penalty spot
 }
 
+// ---- ragdoll smoothing --------------------------------------------------
+static void Spring(Vector3 *pos, Vector3 *vel, Vector3 target, float dt, float k, float d)
+{
+    Vector3 f = Vector3Subtract(Vector3Scale(Vector3Subtract(target, *pos), k), Vector3Scale(*vel, d));
+    *vel = Vector3Add(*vel, Vector3Scale(f, dt));
+    *pos = Vector3Add(*pos, Vector3Scale(*vel, dt));
+}
+static void UpdateGloves(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR)
+{
+    g.kprAxis = Vector3Normalize(Vector3Lerp(g.kprAxis, tAxis, Clamp(13.0f*dt, 0.0f, 1.0f)));
+    Spring(&g.kprGL, &g.kprGLv, tGL, dt, 130.0f, 15.0f);   // under-damped = springy, ragdolly arms
+    Spring(&g.kprGR, &g.kprGRv, tGR, dt, 130.0f, 15.0f);
+}
+
 // ---- keeper reactions (celebration / frustration) -----------------------
-static void ComputeReactionPose(float t)
+static void ComputeReactionPose(float t, float dt)
 {
     const float standY = 1.05f, groundY = 0.42f;
     g.kprHeadOff = (Vector3){0};
@@ -430,10 +448,8 @@ static void ComputeReactionPose(float t)
         }
     }
 
-    g.kprPos  = center;
-    g.kprAxis = axis;
-    g.kprGL   = Vector3Add(center, gl);
-    g.kprGR   = Vector3Add(center, gr);
+    g.kprPos = Vector3Lerp(g.kprPos, center, Clamp(14.0f*dt, 0.0f, 1.0f));   // ease body, don't snap
+    UpdateGloves(dt, axis, Vector3Add(center, gl), Vector3Add(center, gr));
 }
 
 static void KeeperReact(float dt)
@@ -442,12 +458,12 @@ static void KeeperReact(float dt)
         g.kprVel.y -= 11.0f * dt;
         g.kprPos = Vector3Add(g.kprPos, Vector3Scale(g.kprVel, dt));
         float sp = Vector3Length(g.kprVel);
-        g.kprAxis = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
-        g.kprGL = GlovePos(-1); g.kprGR = GlovePos(+1);
+        Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
+        UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1));
         if (g.kprPos.y <= 0.42f) { g.kprPos.y = 0.42f; g.landed = true; g.reactT = 0.0f; g.reactBase = g.kprPos; }
     } else {
         g.reactT += dt;
-        ComputeReactionPose(g.reactT);
+        ComputeReactionPose(g.reactT, dt);
     }
 }
 
@@ -487,6 +503,9 @@ static void UpdateDrawFrame(void)
         StepNet(dt);
         if (!g.resolved) {
             StepKeeper(dt);
+            { float sp = Vector3Length(g.kprVel);
+              Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
+              UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1)); }
             StepBallLive(dt);
             g.flight += dt;
             if (!g.resolved && g.flight > 4.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
@@ -523,23 +542,16 @@ static void UpdateDrawFrame(void)
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
 
-        {   // keeper: flight pose from dive velocity, or the reaction pose when resolved
-            Vector3 axis, gL, gR, headExtra = (Vector3){0};
-            if (g.resolved) { axis = g.kprAxis; gL = g.kprGL; gR = g.kprGR; headExtra = g.kprHeadOff; }
-            else {
-                axis = (Vector3){0, 1, 0};
-                float sp = Vector3Length(g.kprVel);
-                if (g.kprLaunched && sp > 1.0f) axis = Vector3Scale(g.kprVel, 1.0f/sp);
-                gL = GlovePos(-1); gR = GlovePos(+1);
-            }
-            Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), headExtra);
+        {   // keeper — pose is sprung/eased every frame (ragdoll feel), no snapping
+            Vector3 axis = g.kprAxis;
+            Vector3 head = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(axis, 0.55f)), g.kprHeadOff);
             Vector3 feet = Vector3Subtract(g.kprPos, Vector3Scale(axis, 0.55f));
             Color body = !g.resolved ? (Color){240,190,40,255}
                        : (g.reactCelebrate ? (Color){250,205,55,255} : (Color){205,150,40,255});
             DrawCapsule(feet, head, 0.26f, 8, 8, body);
             DrawSphere(head, 0.17f, (Color){ 250, 225, 130, 255 });
-            DrawSphere(gL, GLOVE_R, (Color){ 40, 210, 235, 255 });
-            DrawSphere(gR, GLOVE_R, (Color){ 40, 210, 235, 255 });
+            DrawSphere(g.kprGL, GLOVE_R, (Color){ 40, 210, 235, 255 });
+            DrawSphere(g.kprGR, GLOVE_R, (Color){ 40, 210, 235, 255 });
         }
         DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
 
