@@ -4,7 +4,9 @@
 #include "raymath.h"
 #include "ballstrike.h"
 #include "jumbotron.h"
+#include "svg.h"
 #include <math.h>
+#include <stdio.h>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -30,6 +32,9 @@
 #define SCRAMBLE_MAX    2
 #define SCRAMBLE_REACH  3.7f
 #define SCRAMBLE_SPEED  9.5f
+
+#define CAM_POS        (Vector3){ 0.0f, 2.6f, -6.5f }
+#define CAM_TGT        (Vector3){ 0.0f, 1.4f, GOAL_Z }
 
 #define NET_NX         17
 #define NET_NY         11
@@ -65,12 +70,30 @@ typedef struct {
     // touch input
     bool    touchCharge;
     float   pressX;
+    // bullet-time replay
+    bool    cine;
+    float   cineT, cineDur, cineAng0, cineDir, closest;
+    Vector3 cineFocus;
     Camera3D cam;
 } Game;
 
 static Game    g;
 static NetNode gNet[NET_NY][NET_NX];
 static float   gNetDx, gNetDy;
+
+// ---- baked SVG art: the ball skin and the keeper's face (one bake at boot) ----
+#define FACE_SKINS 4
+static Texture2D  gBallTex;
+static Model      gBallModel;
+static Quaternion gBallRot;                 // accumulated tumble so the skin rolls
+static Texture2D  gFaceTex[FACE_SKINS];
+static int        gFaceSel;                 // which face this keeper wears
+static const Color gSkinTone[FACE_SKINS] = {
+    {247,206,168,255}, {225,170,120,255}, {171,116,74,255}, {112,76,52,255},
+};
+static const Color gHairTone[FACE_SKINS] = {
+    {74,48,28,255}, {32,24,20,255}, {26,20,17,255}, {20,15,13,255},
+};
 
 typedef struct { Color a, b; } Team;   // primary, secondary kit colors
 static const Team TEAMS[] = {
@@ -93,6 +116,77 @@ static Moment gRounds[ROUNDS];
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
+
+// ---- baked art ----------------------------------------------------------
+// A classic black-pentagon football, authored as an equirectangular SVG so it
+// wraps a UV sphere. Pentagons near the poles are widened to fight uv stretch.
+static void BuildBallSvg(char *b)
+{
+    int o = sprintf(b, "<svg viewBox='0 0 360 180'>"
+                       "<rect x='0' y='0' width='360' height='180' fill='#eef0ec'/>");
+    static const float C[][3] = {
+        { 40,45,10},{130,55,-20},{220,48,30},{310,52, 0},
+        { 80,95,15},{175,100,-10},{270,95,25},{350,98, 5},
+        { 20,140,-15},{115,150,20},{210,145,-25},{300,148,10},
+        {180,16,0},{180,164,0},
+    };
+    for (int i = 0; i < (int)(sizeof(C)/sizeof(C[0])); i++) {
+        float lon = C[i][0], lat = C[i][1], rot = C[i][2]*DEG2RAD;
+        float latf = sinf(lat*DEG2RAD); if (latf < 0.34f) latf = 0.34f;
+        float rx = fminf(15.0f/latf, 46.0f), ry = 15.0f;
+        o += sprintf(b+o, "<polygon points='");
+        for (int k = 0; k < 5; k++) {
+            float a = rot + k*(2*PI/5) - PI/2;
+            o += sprintf(b+o, "%.1f,%.1f ", lon + cosf(a)*rx, lat + sinf(a)*ry);
+        }
+        o += sprintf(b+o, "' fill='#16181c'/>");
+    }
+    sprintf(b+o, "</svg>");
+}
+// A friendly Mii-ish face on a transparent field (composited over any skin tone).
+static void BuildFaceSvg(char *b, Color hair)
+{
+    int o = sprintf(b, "<svg viewBox='0 0 100 100'>");
+    o += sprintf(b+o, "<path d='M17,42 Q19,15 50,13 Q81,15 83,42 Q71,29 50,29 Q29,29 17,42 Z' fill='#%02x%02x%02x'/>",
+                 hair.r, hair.g, hair.b);
+    o += sprintf(b+o, "<rect x='29' y='43' width='15' height='4' rx='2' fill='#2a2620'/>");
+    o += sprintf(b+o, "<rect x='56' y='43' width='15' height='4' rx='2' fill='#2a2620'/>");
+    o += sprintf(b+o, "<ellipse cx='37' cy='53' rx='7' ry='8.5' fill='#ffffff'/>");
+    o += sprintf(b+o, "<ellipse cx='63' cy='53' rx='7' ry='8.5' fill='#ffffff'/>");
+    o += sprintf(b+o, "<circle cx='38' cy='54' r='3.6' fill='#241c18'/>");
+    o += sprintf(b+o, "<circle cx='62' cy='54' r='3.6' fill='#241c18'/>");
+    o += sprintf(b+o, "<circle cx='39.4' cy='52.2' r='1.2' fill='#ffffff'/>");
+    o += sprintf(b+o, "<circle cx='63.4' cy='52.2' r='1.2' fill='#ffffff'/>");
+    o += sprintf(b+o, "<path d='M50,58 L46.5,68 L53.5,68' fill='none' stroke='#9c7350' stroke-width='2'/>");
+    o += sprintf(b+o, "<path d='M39,75 Q50,82 61,75' fill='none' stroke='#7a2a24' stroke-width='3'/>");
+    sprintf(b+o, "</svg>");
+}
+static void LoadArt(void)
+{
+    static char buf[8192];
+    BuildBallSvg(buf);
+    gBallTex   = SvgTexture(buf, 512, 256);
+    gBallModel = LoadModelFromMesh(GenMeshSphere(BALL_R*3.0f, 22, 22));
+    gBallModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = gBallTex;
+    gBallRot   = QuaternionIdentity();
+    for (int i = 0; i < FACE_SKINS; i++) { BuildFaceSvg(buf, gHairTone[i]); gFaceTex[i] = SvgTexture(buf, 160, 160); }
+}
+// Roll the ball skin: rolling contact tumbles it, sidespin adds visible curl.
+static void SpinBall(float dt)
+{
+    Vector3 w = {0};
+    float sp = Vector3Length(g.ball.vel);
+    if (sp > 0.2f) {
+        Vector3 axis = Vector3CrossProduct((Vector3){0,1,0}, g.ball.vel);
+        if (Vector3Length(axis) > 1e-3f) w = Vector3Scale(Vector3Normalize(axis), sp/(BALL_R*3.0f));
+    }
+    w.y += g.ball.spin.y * 2.2f;
+    float wl = Vector3Length(w);
+    if (wl > 1e-4f) {
+        Quaternion dq = QuaternionFromAxisAngle(Vector3Scale(w, 1.0f/wl), wl*dt);
+        gBallRot = QuaternionNormalize(QuaternionMultiply(dq, gBallRot));
+    }
+}
 
 // ---- net cloth ----------------------------------------------------------
 static void InitNet(void)
@@ -348,11 +442,13 @@ static void StartKick(void)
     ResetKeeper(); InitNet();
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
     g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
+    g.cine = false; g.closest = 1e9f; gBallRot = QuaternionIdentity();
 }
 static void SetupRound(int r)
 {
     Moment m = gRounds[r];
     gEra = m.era; gHome = TEAMS[m.home]; gAway = TEAMS[m.away];
+    gFaceSel = (m.home + r*2 + 1) % FACE_SKINS;          // keeper's look varies by round
     g.target = m.oppGoals;                               // beat the opponent's tally
     for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
     g.kick = 0; g.scored = 0;
@@ -402,6 +498,21 @@ static void Resolve(Result r)
     if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
         g.landed = true;  g.reactOnGround = false; g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z }; g.reactAxis = (Vector3){0,1,0};
     } else { g.landed = false; g.reactOnGround = true; }
+
+    // bullet-time replay: ~1 in 5 plays overall, heavily biased to close calls & saves
+    float pc = 0.08f;
+    if (r == RES_SAVE) pc = 0.55f;
+    else if (r == RES_POST) pc = 0.72f;
+    if (g.closest < 0.45f)      pc += 0.35f;   // a whisker from the gloves
+    else if (g.closest < 0.95f) pc += 0.15f;
+    if (Frand() < pc) {
+        g.cine = true; g.cineT = 0.0f; g.cineDur = 2.4f;
+        Vector3 mid = Vector3Lerp(g.ball.pos, g.kprPos, 0.5f);
+        mid.y = Clamp(mid.y, 0.7f, 1.8f);
+        g.cineFocus = mid;
+        g.cineAng0 = (g.ball.pos.x >= 0.0f) ? -0.5f : 0.5f;   // open from the action's side
+        g.cineDir  = (g.ball.pos.x >= 0.0f) ?  1.0f : -1.0f;
+    }
 }
 
 // turf: bounce if descending fast, else roll — and KILL spin so it can't spiral
@@ -431,6 +542,15 @@ static void StepBallLive(float dt)
         Vector3 prev = g.ball.pos;
         BallStep(&g.ball, dt / N);
         Vector3 p = g.ball.pos;
+        // how close did it come to keeper/gloves? (drives the replay bias)
+        if (p.z > GOAL_Z - 5.0f) {
+            Vector3 cp[3] = { g.kprPos, GlovePos(-1), GlovePos(+1) };
+            float   cr[3] = { KPR_BODY, GLOVE_R, GLOVE_R };
+            for (int k = 0; k < 3; k++) {
+                float d = Vector3Length(Vector3Subtract(p, cp[k])) - cr[k];
+                if (d < g.closest) g.closest = d;
+            }
+        }
         if (KeeperDeflect()) { Resolve(RES_SAVE); return; }
         if (prev.z < GOAL_Z && p.z >= GOAL_Z) {
             float t  = (GOAL_Z - prev.z) / (p.z - prev.z);
@@ -513,21 +633,75 @@ static void DrawBoardOverlay(void)   // project the board rect + render the live
     }
     DrawJumbotron(rect, bd, GetTime());
 }
+static const Color CROWD_SKIN[3] = { {224,178,138,255}, {188,140,100,255}, {130,90,64,255} };
+
+// one spectator: a colored torso cube + a small head, bobbing by `bob`
+static void DrawFan(float x, float y, float z, float bob, Color body, int h)
+{
+    DrawCube((Vector3){x, y + 0.35f + bob, z}, 0.26f, 0.40f, 0.26f, body);
+    DrawCube((Vector3){x, y + 0.63f + bob, z}, 0.17f, 0.17f, 0.17f, CROWD_SKIN[h % 3]);
+}
+// a waving flag on a pole (drawn both windings so it reads from any angle)
+static void DrawFlag(Vector3 base, float t, float ph, Color col)
+{
+    Vector3 top = { base.x, base.y + 2.0f, base.z };
+    DrawCylinderEx(base, top, 0.04f, 0.04f, 6, (Color){60,60,66,255});
+    const int N = 6; const float W = 1.25f, FH = 0.72f;
+    for (int i = 0; i < N; i++) {
+        float u0 = (float)i/N, u1 = (float)(i+1)/N;
+        float w0 = sinf(t*4.0f + ph + u0*6.0f) * 0.20f * u0;
+        float w1 = sinf(t*4.0f + ph + u1*6.0f) * 0.20f * u1;
+        Vector3 a = { base.x + u0*W, top.y,       base.z + w0 };
+        Vector3 b = { base.x + u1*W, top.y,       base.z + w1 };
+        Vector3 c = { base.x + u1*W, top.y - FH,  base.z + w1 };
+        Vector3 d = { base.x + u0*W, top.y - FH,  base.z + w0 };
+        DrawTriangle3D(a, c, b, col); DrawTriangle3D(a, d, c, col);
+        DrawTriangle3D(a, b, c, col); DrawTriangle3D(a, c, d, col);
+    }
+}
+// pop-off camera flashes scattered through the stands (a storm of them on a goal)
+static void DrawFlashes(float t, int n, float rate)
+{
+    for (int i = 0; i < n; i++) {
+        float ph = i * 127.13f;
+        if (sinf(t*rate + ph*1.7f) < 0.86f) continue;
+        float fx = -16.0f + fmodf(ph*7.31f, 32.0f);
+        float fz = GOAL_Z + 2.4f + fmodf(ph*2.11f, 6.6f);
+        float fy = 0.7f  + fmodf(ph*1.73f, 4.2f);
+        DrawCube((Vector3){fx, fy, fz}, 0.14f, 0.14f, 0.14f, (Color){255,255,246,255});
+    }
+}
+static void DrawFloodlight(float x, float z)
+{
+    Vector3 base = { x, 0.0f, z }, top = { x, 8.6f, z };
+    DrawCylinderEx(base, top, 0.22f, 0.16f, 8, (Color){44,46,54,255});
+    Vector3 head = { x, 9.1f, z };
+    DrawCubeV(head, (Vector3){2.4f, 0.7f, 0.35f}, (Color){60,62,72,255});
+    for (int i = -1; i <= 1; i++)                                   // lamp cells
+        DrawCubeV((Vector3){x + i*0.75f, 9.1f, z - 0.2f}, (Vector3){0.55f, 0.5f, 0.12f}, (Color){255,250,225,255});
+    DrawSphere((Vector3){x, 9.1f, z - 0.35f}, 0.9f, (Color){255,250,220,26});   // soft glow
+}
 static void DrawStadium(void)
 {
     float t = GetTime();
     bool react = g.celebrate > 0.0f;
     bool kickerScored = (g.result == RES_GOAL);       // kicker's fans sit in the away (right) stand
-    const int ROWS = 7, COLS = 54;
+
+    // dark stadium bowl behind the stands, to frame the crowd
+    DrawCubeV((Vector3){0, 4.0f, GOAL_Z + 12.5f}, (Vector3){44.0f, 9.0f, 1.2f}, (Color){22,24,34,255});
+    DrawFloodlight(-19.5f, GOAL_Z + 1.0f);  DrawFloodlight(19.5f, GOAL_Z + 1.0f);
+    DrawFloodlight(-19.5f, GOAL_Z + 10.0f); DrawFloodlight(19.5f, GOAL_Z + 10.0f);
+
+    // ---- back stand (behind the goal) ----
+    const int ROWS = 8, COLS = 54;
     for (int r = 0; r < ROWS; r++) {
         float z = GOAL_Z + 2.7f + r*1.15f;
         float y = 0.2f + r*0.8f;
-        DrawCube((Vector3){0, y - 0.5f, z}, 36.0f, 1.0f, 1.15f, (Color){ 58,60,70,255 });
-        DrawCube((Vector3){0, y - 0.02f, z - 0.5f}, 36.0f, 0.09f, 0.12f, (Color){ 40,42,50,255 });
+        DrawCube((Vector3){0, y - 0.5f, z}, 37.0f, 1.0f, 1.15f, (Color){ 52,54,64,255 });
+        DrawCube((Vector3){0, y - 0.02f, z - 0.5f}, 37.0f, 0.09f, 0.12f, (Color){ 36,38,46,255 });
         for (int c = 0; c < COLS; c++) {
             int h = (r*37 + c*19) % 100;
             float x = -17.0f + c*(34.0f/(COLS-1));
-            // ambient: a slow rolling wave + a gentle per-fan bob
             float yoff = fmaxf(0.0f, sinf(t*1.3f - x*0.22f))*0.10f + sinf(t*2.0f + h)*0.03f;
             if (react) {
                 bool home = (x < 0.0f);                                  // home = the keeper's stand
@@ -535,9 +709,36 @@ static void DrawStadium(void)
                 if (happy) yoff = fabsf(sinf(t*12.0f + h)) * 0.36f;       // leaping to their feet
                 else       yoff = -0.14f + sinf(t*2.5f + h)*0.02f;        // slumped, seated
             }
-            DrawCube((Vector3){x, y + 0.35f + yoff, z}, 0.26f, 0.4f, 0.26f, FanColor(x, h));
+            DrawFan(x, y, z, yoff, FanColor(x, h), h);
         }
     }
+    // ---- side stands (along the touchlines) ----
+    const int SROWS = 5, SCOLS = 22;
+    for (int side = -1; side <= 1; side += 2) {
+        for (int r = 0; r < SROWS; r++) {
+            float x = side * (18.6f + r*0.95f);
+            float y = 0.3f + r*0.8f;
+            DrawCube((Vector3){x, y - 0.5f, GOAL_Z + 2.5f}, 1.3f, 1.0f, 15.0f, (Color){ 48,50,60,255 });
+            for (int c = 0; c < SCOLS; c++) {
+                int h = (r*29 + c*23 + side*7) % 100;
+                float z = GOAL_Z - 3.4f + c*(13.0f/(SCOLS-1));
+                float yoff = fmaxf(0.0f, sinf(t*1.1f + z*0.3f))*0.09f + sinf(t*1.8f + h)*0.03f;
+                if (react) {
+                    bool happy = (x < 0.0f) ? !kickerScored : kickerScored;
+                    yoff = happy ? fabsf(sinf(t*11.0f + h))*0.32f : -0.12f;
+                }
+                DrawFan(x, y, z, yoff, FanColor(x, h), h);
+            }
+        }
+    }
+    // ---- banners waving over the back stand ----
+    for (int i = 0; i < 6; i++) {
+        float fx = -14.0f + i*5.4f;
+        Color fc = (i % 2) ? gAway.a : gHome.a;
+        DrawFlag((Vector3){fx, 5.6f, GOAL_Z + 3.2f}, t, i*1.7f, fc);
+    }
+    // ---- camera flashes: a constant sprinkle, a storm on a goal/save ----
+    DrawFlashes(t, react ? 90 : 16, react ? 9.0f : 2.4f);
 }
 
 // ---- pitch markings -----------------------------------------------------
@@ -568,38 +769,82 @@ static void FireShot(void)
     g.phase = PHASE_FLY;
 }
 
-// ---- keeper model (Mii-ish: head + rounded body + arms; hip anchors reserved for legs) ----
+// ---- keeper model (Mii-ish: head + rounded body + arms + two-segment legs) ----
 static void DrawKeeper(void)
 {
     Vector3 up = (Vector3Length(g.kprAxis) > 0.1f) ? Vector3Normalize(g.kprAxis) : (Vector3){0,1,0};
     Vector3 side = Vector3CrossProduct(up, (Vector3){0,0,1});
     if (Vector3Length(side) < 0.1f) side = (Vector3){1,0,0};
     side = Vector3Normalize(side);
+    Vector3 fwd = Vector3CrossProduct(up, side);                 // body front (~ -z upright)
+    if (Vector3Length(fwd) < 0.1f) fwd = (Vector3){0,0,-1};
+    fwd = Vector3Normalize(fwd);
 
     Vector3 hip      = Vector3Add(g.kprPos, Vector3Scale(up, -0.30f));
     Vector3 shoulder = Vector3Add(g.kprPos, Vector3Scale(up,  0.26f));
     Vector3 headPos  = Vector3Add(Vector3Add(g.kprPos, Vector3Scale(up, 0.60f)), g.kprHeadOff);
 
     Color kit  = gHome.a;
-    if (g.resolved && !g.reactCelebrate)
-        kit = (Color){ (unsigned char)(kit.r*0.7f), (unsigned char)(kit.g*0.7f), (unsigned char)(kit.b*0.7f), 255 };
-    Color skin = (Color){ 245, 205, 160, 255 };
+    Color sock = gHome.b;
+    if (g.resolved && !g.reactCelebrate) {                        // beaten keeper darkens
+        kit  = (Color){ (unsigned char)(kit.r*0.7f),  (unsigned char)(kit.g*0.7f),  (unsigned char)(kit.b*0.7f),  255 };
+        sock = (Color){ (unsigned char)(sock.r*0.7f), (unsigned char)(sock.g*0.7f), (unsigned char)(sock.b*0.7f), 255 };
+    }
+    Color skin = gSkinTone[gFaceSel];
+    Color boot = (Color){ 28, 28, 34, 255 };
 
-    DrawCapsule(hip, shoulder, 0.30f, 12, 10, kit);               // rounded torso
-    DrawSphere(headPos, 0.30f, skin);                             // big Mii-style head
-    Vector3 shL = Vector3Add(shoulder, Vector3Scale(side, -0.28f));
-    Vector3 shR = Vector3Add(shoulder, Vector3Scale(side,  0.28f));
-    DrawCylinderEx(shL, g.kprGL, 0.09f, 0.06f, 8, kit);           // upper arms -> gloves
-    DrawCylinderEx(shR, g.kprGR, 0.09f, 0.06f, 8, kit);
-    DrawSphere(g.kprGL, GLOVE_R, gHome.b);                        // gloves (hands)
-    DrawSphere(g.kprGR, GLOVE_R, gHome.b);
-
-    // hip anchors — attach points for legs (a future session hangs cylinders from these)
+    // legs: hip -> knee (thigh, kit shorts) -> foot (shin, sock) -> boot; they
+    // trail along -up, so an upright keeper stands and a diving one splays out.
     Vector3 hipL = Vector3Add(hip, Vector3Scale(side, -0.15f));
     Vector3 hipR = Vector3Add(hip, Vector3Scale(side,  0.15f));
-    DrawSphere(hipL, 0.12f, kit);
-    DrawSphere(hipR, 0.12f, kit);
-    // legs: DrawCylinderEx(hipL, footL, ...) / (hipR, footR, ...) once foot targets exist.
+    for (int s = -1; s <= 1; s += 2) {
+        Vector3 hp  = (s < 0) ? hipL : hipR;
+        Vector3 kn  = Vector3Add(Vector3Add(hp, Vector3Scale(up, -0.28f)),
+                                 Vector3Add(Vector3Scale(fwd, 0.10f), Vector3Scale(side, s*0.02f)));
+        Vector3 ft  = Vector3Add(Vector3Add(kn, Vector3Scale(up, -0.26f)), Vector3Scale(fwd, 0.06f));
+        Vector3 toe = Vector3Add(Vector3Add(ft, Vector3Scale(fwd, 0.15f)), Vector3Scale(up, -0.03f));
+        DrawCylinderEx(hp, kn, 0.12f, 0.10f, 10, kit);           // thigh (shorts)
+        DrawSphere(kn, 0.10f, sock);                             // knee
+        DrawCylinderEx(kn, ft, 0.10f, 0.075f, 10, sock);         // shin (sock)
+        DrawCylinderEx(ft, toe, 0.085f, 0.05f, 8, boot);         // boot
+        DrawSphere(ft, 0.085f, boot);                            // heel
+    }
+
+    DrawCapsule(hip, shoulder, 0.30f, 12, 10, kit);              // rounded torso
+    Vector3 shL = Vector3Add(shoulder, Vector3Scale(side, -0.28f));
+    Vector3 shR = Vector3Add(shoulder, Vector3Scale(side,  0.28f));
+    DrawCylinderEx(shL, g.kprGL, 0.09f, 0.06f, 8, kit);          // upper arms -> gloves
+    DrawCylinderEx(shR, g.kprGR, 0.09f, 0.06f, 8, kit);
+    DrawSphere(g.kprGL, GLOVE_R, gHome.b);                       // gloves (hands)
+    DrawSphere(g.kprGR, GLOVE_R, gHome.b);
+
+    DrawSphere(headPos, 0.30f, skin);                            // big Mii-style head
+    // face: a billboard sitting just proud of the head surface (radius 0.30),
+    // so it is never swallowed by the sphere; tilts with the keeper's up axis
+    Vector3 toCam = Vector3Normalize(Vector3Subtract(g.cam.position, headPos));
+    Vector3 facePos = Vector3Add(headPos, Vector3Scale(toCam, 0.32f));
+    DrawBillboardPro(g.cam, gFaceTex[gFaceSel],
+                     (Rectangle){0, 0, (float)gFaceTex[gFaceSel].width, (float)gFaceTex[gFaceSel].height},
+                     facePos, up, (Vector2){0.60f, 0.60f}, (Vector2){0.30f, 0.30f}, 0.0f, WHITE);
+}
+
+// ---- replay camera ------------------------------------------------------
+// Eases the camera between its fixed match view and an orbiting closeup that
+// spins around the save/goal during a bullet-time replay.
+static void DriveCamera(float dt)
+{
+    Vector3 wantP = CAM_POS, wantT = CAM_TGT;
+    if (g.cine) {
+        float u  = Clamp(g.cineT / g.cineDur, 0.0f, 1.0f);
+        float R  = Lerp(4.4f, 2.7f, u);                       // dolly in as it sweeps
+        float th = g.cineAng0 + g.cineDir * u * 3.1f;         // ~175° arc around the action
+        Vector3 f = g.cineFocus;
+        wantT = f;
+        wantP = (Vector3){ f.x + sinf(th)*R, f.y + 1.05f + sinf(u*PI)*0.55f, f.z - cosf(th)*R };
+    }
+    float k = Clamp((g.cine ? 9.0f : 4.5f) * dt, 0.0f, 1.0f);
+    g.cam.position = Vector3Lerp(g.cam.position, wantP, k);
+    g.cam.target   = Vector3Lerp(g.cam.target,   wantT, k);
 }
 
 // ---- main frame ---------------------------------------------------------
@@ -609,6 +854,8 @@ static void UpdateDrawFrame(void)
     if (dt > 0.05f) dt = 0.05f;
     if (g.celebrate > 0.0f) g.celebrate -= dt;
     if (g.scrambleCd > 0.0f) g.scrambleCd -= dt;
+    if (g.cine) { g.cineT += dt; if (g.cineT >= g.cineDur) g.cine = false; }
+    float sdt = g.cine ? dt * 0.25f : dt;                     // bullet-time slows the sim
     Vector2 m = GetMousePosition();
 
     switch (g.phase) {
@@ -643,7 +890,7 @@ static void UpdateDrawFrame(void)
     } break;
 
     case PHASE_FLY: {
-        StepNet(dt);
+        StepNet(sdt);
         if (!g.resolved) {
             StepKeeper(dt);
             TryScramble();                     // late lunge for a loose/slow ball
@@ -651,11 +898,12 @@ static void UpdateDrawFrame(void)
               Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
               UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1)); }
             StepBallLive(dt);
+            SpinBall(dt);
             g.flight += dt;
             if (!g.resolved && g.flight > 5.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
         } else {
-            KeeperReact(dt); StepBallSettle(dt); g.resultTimer += dt;
-            if (g.landed && g.reactT > REACT_DUR) {
+            KeeperReact(sdt); StepBallSettle(sdt); SpinBall(sdt); g.resultTimer += sdt;
+            if (!g.cine && g.landed && g.reactT > REACT_DUR) {
                 g.kick++;
                 int left = KICKS_TOTAL - g.kick;
                 bool decided = (g.scored > g.target) || (g.scored + left <= g.target) || (g.kick >= KICKS_TOTAL);
@@ -670,7 +918,7 @@ static void UpdateDrawFrame(void)
     } break;
 
     case PHASE_RESULT:
-        StepNet(dt); KeeperReact(dt);
+        StepNet(sdt); KeeperReact(sdt); SpinBall(sdt);
         if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             if (g.gameWon || g.gameLost) ResetMatch();
             else { g.round++; SetupRound(g.round); }     // round cleared -> next round
@@ -678,10 +926,13 @@ static void UpdateDrawFrame(void)
         break;
     }
 
+    DriveCamera(dt);
+
     // ---- draw ----
     int W = GetScreenWidth(), H = GetScreenHeight();
     BeginDrawing();
-    ClearBackground((Color){ 20, 24, 32, 255 });
+    ClearBackground((Color){ 14, 16, 26, 255 });
+    DrawRectangleGradientV(0, 0, W, H, (Color){ 26, 30, 56, 255 }, (Color){ 58, 48, 70, 255 });   // dusk sky
     BeginMode3D(g.cam);
         DrawStadium();
         DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
@@ -691,7 +942,8 @@ static void UpdateDrawFrame(void)
         DrawCube((Vector3){0, GOAL_H, GOAL_Z}, GOAL_HALF_W*2, POST_R*2, POST_R*2, RAYWHITE);
         DrawNet();
         DrawKeeper();
-        DrawSphere(g.ball.pos, BALL_R * 3.0f, RAYWHITE);
+        gBallModel.transform = QuaternionToMatrix(gBallRot);
+        DrawModel(gBallModel, g.ball.pos, 1.0f, WHITE);
         if (g.phase == PHASE_AIM || g.phase == PHASE_CHARGE) {
             Strike s = { .power = 13.0f + g.power01*16.0f, .yaw = g.yaw, .pitch = g.pitch, .curve = g.curve*3.0f };
             Ball tb = BallLaunch((Vector3){0, BALL_R, 0}, s);
@@ -717,6 +969,19 @@ static void UpdateDrawFrame(void)
             DrawText(hint, W/2 - MeasureText(hint, fs)/2, H - mg - fs, fs, (Color){210,216,224,220});
         }
     }
+
+    // ---- bullet-time replay: letterbox + badge ----
+    if (g.cine) {
+        int bh = (int)(H * 0.09f * Clamp(fminf(g.cineT, g.cineDur - g.cineT) / 0.25f, 0.0f, 1.0f));
+        DrawRectangle(0, 0, W, bh, (Color){0,0,0,235});
+        DrawRectangle(0, H - bh, W, bh, (Color){0,0,0,235});
+        if (bh > 5) {
+            int fs = (int)Clamp(H*0.030f, 12.0f, 26.0f);
+            bool blink = fmodf(g.cineT, 0.7f) < 0.45f;
+            DrawText("REPLAY", (int)(W*0.045f) + fs + 6, bh/2 - fs/2, fs, (Color){232,236,242,235});
+            if (blink) DrawCircle((int)(W*0.045f) + fs/2, bh/2, fs*0.32f, (Color){235,80,80,255});
+        }
+    }
     EndDrawing();
 }
 
@@ -725,9 +990,11 @@ int main(void)
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(900, 600, "Arcade - World Cup Penalty");
 
+    LoadArt();                        // bake ball skin + keeper faces (needs the GL context)
+
     g.cam = (Camera3D){0};
-    g.cam.position   = (Vector3){ 0.0f, 2.6f, -6.5f };
-    g.cam.target     = (Vector3){ 0.0f, 1.4f, GOAL_Z };
+    g.cam.position   = CAM_POS;
+    g.cam.target     = CAM_TGT;
     g.cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
     g.cam.fovy       = 55.0f;
     g.cam.projection = CAMERA_PERSPECTIVE;
