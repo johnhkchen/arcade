@@ -54,7 +54,7 @@ typedef struct {
     // keeper reaction (celebration / frustration)
     Vector3 kprAxis, kprGL, kprGR, kprGLv, kprGRv, kprHeadOff, reactBase;
     int     reactAnim;
-    bool    reactCelebrate, reactOnGround, landed;
+    bool    reactCelebrate, reactOnGround, landed, reactHeld;
     float   reactT;
     // flow
     int     kick, scored;
@@ -260,6 +260,7 @@ static void Resolve(Result r)
     // pick the keeper's reaction
     g.reactAnim = GetRandomValue(0, 4);
     g.reactCelebrate = (r != RES_GOAL);         // happy unless it was beaten
+    g.reactHeld = (r == RES_SAVE && g.caught);   // did it CATCH the ball (vs parry / no touch)?
     g.reactT = 0.0f;
     g.kprHeadOff = (Vector3){0};
     if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
@@ -316,9 +317,8 @@ static void StepBallLive(float dt)
 
 static void StepBallSettle(float dt)
 {
-    if (g.caught) {   // hands gather the ball in — reach, then guide, no snapping
-        Vector3 cradle = Vector3Add(g.kprPos, (Vector3){ 0.0f, -0.05f, -0.30f });
-        g.ball.pos = Vector3Lerp(g.ball.pos, cradle, Clamp(6.0f * dt, 0.0f, 1.0f));
+    if (g.caught) {   // ball is in the right glove — it rides the hand through the celebration
+        g.ball.pos = Vector3Lerp(g.ball.pos, g.kprGR, Clamp(9.0f * dt, 0.0f, 1.0f));
         g.ball.vel = (Vector3){0};
         return;
     }
@@ -420,7 +420,19 @@ static void ComputeReactionPose(float t, float dt)
     float lt = fmaxf(0.0f, t - (g.reactOnGround ? 1.0f : 0.0f));   // time spent standing
     float w  = lt * 6.0f;
 
-    if (g.reactCelebrate) {
+    if (g.reactCelebrate && g.reactHeld) {
+        switch (g.reactAnim) {   // ball rides the RIGHT glove (gr) unless dropped
+        case 0: gr = (Vector3){0.3f,0.75f,0.0f};
+                gl.y = 0.15f + fabsf(sinf(w))*0.5f; center.y += fabsf(sinf(w))*0.05f*up; break;    // hold it aloft
+        case 1: gr = (Vector3){0.25f,0.28f,-0.05f}; gl = (Vector3){-0.25f, 0.28f + sinf(w)*0.1f, -0.05f};
+                center.y += fabsf(sinf(w*1.2f))*0.08f*up; break;                                   // clutch & pat, hops
+        case 2: if (g.caught) { gr = (Vector3){0.3f,0.05f,0.0f}; gl = (Vector3){-0.35f,0.15f,0.0f}; }
+                else { gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f; } break; // drop -> pump
+        case 3: gr = (Vector3){0.15f,0.55f,0.15f}; gl = (Vector3){-0.35f,0.05f,0.0f}; break;       // kiss the ball
+        case 4: if (g.caught) { gr = (Vector3){0.3f,0.6f,0.0f}; gl = (Vector3){-0.3f,0.4f,0.0f}; }
+                else { gl = (Vector3){-0.6f,0.35f,0.0f}; gr = (Vector3){0.6f,0.35f,0.0f}; } break;  // spike -> arms out
+        }
+    } else if (g.reactCelebrate) {
         switch (g.reactAnim) {
         case 0: gl.y = 0.15f + fabsf(sinf(w))*0.5f; gr.y = 0.15f + fabsf(sinf(w+1.6f))*0.5f;
                 center.y += fabsf(sinf(w))*0.05f*up; break;                                    // fist pumps
@@ -464,6 +476,11 @@ static void KeeperReact(float dt)
     } else {
         g.reactT += dt;
         ComputeReactionPose(g.reactT, dt);
+        if (g.reactHeld && g.caught &&                        // some catch celebrations drop the ball
+            ((g.reactAnim == 2 && g.reactT > 0.9f) || (g.reactAnim == 4 && g.reactT > 0.7f))) {
+            g.caught = false;
+            if (g.reactAnim == 4) g.ball.vel = (Vector3){ 0.0f, -1.5f, -2.5f };   // spike it down/out
+        }
     }
 }
 
