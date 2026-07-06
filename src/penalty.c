@@ -127,6 +127,19 @@ static const Moment POOL[] = {
 };
 static Moment gRounds[ROUNDS];
 
+// ---- in-universe sponsors: the b28 product family on pitch-side hoardings ----
+typedef struct { const char *name, *tag; Color bg, fg, accent; } Sponsor;
+#define NSPON 6
+static const Sponsor SPONSORS[NSPON] = {
+    { "b28.dev",    "make yourself at home",   { 68,103,155,255}, {250,248,245,255}, {242,239,233,255} },
+    { "LISA",       "runs your coding agents", { 20, 24, 32,255}, {120,220,140,255}, { 90,180,110,255} },
+    { "vend",       "intent to backlog",       {228,120, 42,255}, { 24, 20, 16,255}, {255,222,120,255} },
+    { "PLANTASTIC", "plan a garden",           { 28,118, 70,255}, {240,246,236,255}, {150,212,120,255} },
+    { "PIVOTAL IQ", "find the grants",         { 22, 40, 92,255}, {236,240,250,255}, {110,150,235,255} },
+    { "ROWCLEAR",   "falling blocks",          { 62, 42,112,255}, {245,240,255,255}, {170,122,240,255} },
+};
+static Texture2D gBannerTex[NSPON];
+
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
 
@@ -219,6 +232,28 @@ static void BuildExprSvg(char *b, int expr)
     o += sprintf(b+o, "<path d='M50,53 L45,65 L55,65' fill='none' stroke='#00000022' stroke-width='2.5'/>");
     o += sprintf(b+o, "%s</svg>", mouth);
 }
+// A retro advertising hoarding: chunky raylib pixel-font on a team-colored board.
+static Texture2D BakeBanner(Sponsor s)
+{
+    const int W = 512, H = 128;
+    Image im = GenImageColor(W, H, s.bg);
+    ImageDrawRectangle(&im, 0, 0, W, 12, s.accent);                 // top/bottom rails
+    ImageDrawRectangle(&im, 0, H-12, W, 12, s.accent);
+    for (int i = 0; i < W/24; i++)                                  // pixel-block trim
+        ImageDrawRectangle(&im, i*24 + (i%2?6:0), (i%2)?2:H-10, 12, 8, s.fg);
+    Font f = GetFontDefault();
+    Vector2 nm = MeasureTextEx(f, s.name, 52, 4);
+    ImageDrawTextEx(&im, f, s.name, (Vector2){ (W-nm.x)/2, 28 }, 52, 4, s.fg);
+    if (s.tag) {
+        Vector2 tg = MeasureTextEx(f, s.tag, 18, 2);
+        ImageDrawTextEx(&im, f, s.tag, (Vector2){ (W-tg.x)/2, 92 }, 18, 2, s.accent);
+    }
+    ImageFlipHorizontal(&im);                                       // DrawDecal mirrors u; pre-flip so text reads
+    Texture2D t = LoadTextureFromImage(im);
+    SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
+    UnloadImage(im);
+    return t;
+}
 static void LoadArt(void)
 {
     static char buf[8192];
@@ -235,6 +270,7 @@ static void LoadArt(void)
         UnloadImage(im);
     }
     for (int e = 0; e < EXPR_COUNT; e++) { BuildExprSvg(buf, e); gExprTex[e] = SvgTexture(buf, 176, 176); }
+    for (int i = 0; i < NSPON; i++) gBannerTex[i] = BakeBanner(SPONSORS[i]);
 }
 // Draw a texture as a flat quad centered at `c`, facing `nrm`, with `up` as its
 // vertical — used for the face decal so it turns to look wherever the ball is.
@@ -788,6 +824,17 @@ static void DrawFloodlight(float x, float z)
         DrawCubeV((Vector3){x + i*0.75f, 9.1f, z - 0.2f}, (Vector3){0.55f, 0.5f, 0.12f}, (Color){255,250,225,255});
     DrawSphere((Vector3){x, 9.1f, z - 0.35f}, 0.9f, (Color){255,250,220,26});   // soft glow
 }
+// pitch-side sponsor hoardings, a row behind the goal facing the pitch
+static void DrawBanners(void)
+{
+    const int n = 9;
+    float bw = 3.3f, bh = 0.9f, y = 0.72f, z = GOAL_Z + 2.15f;
+    DrawCube((Vector3){0, y, z + 0.06f}, n*bw, bh + 0.12f, 0.1f, (Color){18,20,26,255});   // backing rail
+    for (int i = 0; i < n; i++) {
+        float x = (-(n-1)/2.0f + i) * bw;
+        DrawDecal(gBannerTex[(i + g.round) % NSPON], (Vector3){x, y, z}, (Vector3){0,0,-1}, (Vector3){0,1,0}, bw*0.96f, bh);
+    }
+}
 static void DrawStadium(void)
 {
     float t = GetTime();
@@ -1077,6 +1124,7 @@ static void UpdateDrawFrame(void)
     DrawRectangleGradientV(0, 0, W, H, (Color){ 26, 30, 56, 255 }, (Color){ 58, 48, 70, 255 });   // dusk sky
     BeginMode3D(g.cam);
         DrawStadium();
+        DrawBanners();
         DrawPlane((Vector3){0, 0, 9}, (Vector2){44, 34}, (Color){ 34, 78, 46, 255 });
         DrawPitch();
         DrawCube((Vector3){-GOAL_HALF_W, GOAL_H/2, GOAL_Z}, POST_R*2, GOAL_H, POST_R*2, RAYWHITE);
