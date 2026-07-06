@@ -2,11 +2,13 @@
 // Skin #1 over the shared ballstrike core.
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 #include "ballstrike.h"
 #include "jumbotron.h"
 #include "svg.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -71,7 +73,7 @@ typedef struct {
     bool    touchCharge;
     float   pressX;
     // bullet-time replay
-    bool    cine;
+    bool    cine, cineArmed;
     float   cineT, cineDur, cineAng0, cineDir, closest;
     Vector3 cineFocus;
     Camera3D cam;
@@ -81,13 +83,16 @@ static Game    g;
 static NetNode gNet[NET_NY][NET_NX];
 static float   gNetDx, gNetDy;
 
-// ---- baked SVG art: the ball skin and the keeper's face (one bake at boot) ----
+// ---- baked art: the ball skin, and the keeper's shaded head + expression decals ----
 #define FACE_SKINS 4
+enum { EXPR_FOCUS, EXPR_WORRY, EXPR_HAPPY, EXPR_ANGRY, EXPR_COUNT };
 static Texture2D  gBallTex;
 static Model      gBallModel;
 static Quaternion gBallRot;                 // accumulated tumble so the skin rolls
-static Texture2D  gFaceTex[FACE_SKINS];
-static int        gFaceSel;                 // which face this keeper wears
+static Texture2D  gHeadTex[FACE_SKINS];     // shaded skin sphere + hair cap (one per skin)
+static Model      gHeadModel;               // reused; retextured per keeper
+static Texture2D  gExprTex[EXPR_COUNT];     // transparent face features, one per emotion
+static int        gFaceSel;                 // which skin this keeper wears
 static const Color gSkinTone[FACE_SKINS] = {
     {247,206,168,255}, {225,170,120,255}, {171,116,74,255}, {112,76,52,255},
 };
@@ -143,23 +148,73 @@ static void BuildBallSvg(char *b)
     }
     sprintf(b+o, "</svg>");
 }
-// A friendly Mii-ish face on a transparent field (composited over any skin tone).
-static void BuildFaceSvg(char *b, Color hair)
+// A shaded skin head with a hair cap, baked per pixel of an equirectangular map.
+// Both the top-light gradient and the hair band are functions of latitude only,
+// so the head reads correctly at any spin about its pole (which we aim at "up").
+static Image BuildHeadImage(Color skin, Color hair)
+{
+    const int W = 160, H = 96;
+    unsigned char *px = (unsigned char *)malloc((size_t)W*H*4);
+    for (int y = 0; y < H; y++) {
+        float lat = (float)y / (H - 1);                       // 0 = crown, 1 = chin/neck
+        float shade = Clamp(1.12f - lat*0.62f - 0.20f*fmaxf(0.0f, lat-0.75f)*4.0f, 0.55f, 1.12f);
+        for (int x = 0; x < W; x++) {
+            float u = (float)x / (W - 1);
+            // hair: a cap over the crown with a soft, slightly scalloped fringe
+            float fringe = 0.30f + 0.045f*sinf(u*2*PI*3.0f) + 0.02f*sinf(u*2*PI*7.0f);
+            Color c;
+            if (lat < fringe) {
+                float hs = Clamp(1.05f - lat*0.5f, 0.7f, 1.1f);
+                c = (Color){ (unsigned char)(hair.r*hs), (unsigned char)(hair.g*hs), (unsigned char)(hair.b*hs), 255 };
+            } else {
+                c = (Color){ (unsigned char)fminf(skin.r*shade,255), (unsigned char)fminf(skin.g*shade,255),
+                             (unsigned char)fminf(skin.b*shade,255), 255 };
+            }
+            unsigned char *p = px + ((size_t)y*W + x)*4;
+            p[0]=c.r; p[1]=c.g; p[2]=c.b; p[3]=255;
+        }
+    }
+    return (Image){ px, W, H, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+}
+// An expression: crisp SVG features on a transparent field, composited over the
+// shaded head. Brows/eyes/mouth are swapped by emotion; a soft socket adds depth.
+static void BuildExprSvg(char *b, int expr)
 {
     int o = sprintf(b, "<svg viewBox='0 0 100 100'>");
-    o += sprintf(b+o, "<path d='M17,42 Q19,15 50,13 Q81,15 83,42 Q71,29 50,29 Q29,29 17,42 Z' fill='#%02x%02x%02x'/>",
-                 hair.r, hair.g, hair.b);
-    o += sprintf(b+o, "<rect x='29' y='43' width='15' height='4' rx='2' fill='#2a2620'/>");
-    o += sprintf(b+o, "<rect x='56' y='43' width='15' height='4' rx='2' fill='#2a2620'/>");
-    o += sprintf(b+o, "<ellipse cx='37' cy='53' rx='7' ry='8.5' fill='#ffffff'/>");
-    o += sprintf(b+o, "<ellipse cx='63' cy='53' rx='7' ry='8.5' fill='#ffffff'/>");
-    o += sprintf(b+o, "<circle cx='38' cy='54' r='3.6' fill='#241c18'/>");
-    o += sprintf(b+o, "<circle cx='62' cy='54' r='3.6' fill='#241c18'/>");
-    o += sprintf(b+o, "<circle cx='39.4' cy='52.2' r='1.2' fill='#ffffff'/>");
-    o += sprintf(b+o, "<circle cx='63.4' cy='52.2' r='1.2' fill='#ffffff'/>");
-    o += sprintf(b+o, "<path d='M50,58 L46.5,68 L53.5,68' fill='none' stroke='#9c7350' stroke-width='2'/>");
-    o += sprintf(b+o, "<path d='M39,75 Q50,82 61,75' fill='none' stroke='#7a2a24' stroke-width='3'/>");
-    sprintf(b+o, "</svg>");
+    o += sprintf(b+o, "<ellipse cx='37' cy='55' rx='11' ry='11' fill='#00000014'/>");   // soft sockets
+    o += sprintf(b+o, "<ellipse cx='63' cy='55' rx='11' ry='11' fill='#00000014'/>");
+    const char *browL, *browR, *mouth; float ey, eyry, pdy;
+    switch (expr) {
+    case EXPR_WORRY:                                                                    // brows up-inner, wide eyes
+        browL = "<path d='M27,44 L44,40' stroke='#2a2620' stroke-width='4'/>";
+        browR = "<path d='M56,40 L73,44' stroke='#2a2620' stroke-width='4'/>";
+        mouth = "<ellipse cx='50' cy='75' rx='5' ry='6' fill='#4a1c18'/>";
+        ey = 55; eyry = 9.5f; pdy = 1.5f; break;
+    case EXPR_HAPPY:                                                                    // arched brows, big smile
+        browL = "<path d='M28,40 Q36,36 45,40' stroke='#2a2620' stroke-width='4' fill='none'/>";
+        browR = "<path d='M55,40 Q64,36 72,40' stroke='#2a2620' stroke-width='4' fill='none'/>";
+        mouth = "<path d='M36,72 Q50,86 64,72 Q50,78 36,72 Z' fill='#7a2a24'/>";
+        ey = 54; eyry = 8.0f; pdy = -1.5f; break;
+    case EXPR_ANGRY:                                                                    // furrowed brows, grimace
+        browL = "<path d='M28,40 L45,47' stroke='#241f1a' stroke-width='5'/>";
+        browR = "<path d='M55,47 L72,40' stroke='#241f1a' stroke-width='5'/>";
+        mouth = "<path d='M37,78 Q50,72 63,78' stroke='#5a201c' stroke-width='4' fill='none'/>";
+        ey = 56; eyry = 7.0f; pdy = 1.0f; break;
+    default:            /* EXPR_FOCUS */                                               // level brows, steady eyes
+        browL = "<path d='M28,42 L45,43' stroke='#2a2620' stroke-width='4'/>";
+        browR = "<path d='M55,43 L72,42' stroke='#2a2620' stroke-width='4'/>";
+        mouth = "<path d='M42,75 L58,75' stroke='#6a2620' stroke-width='3'/>";
+        ey = 55; eyry = 8.5f; pdy = 1.0f; break;
+    }
+    o += sprintf(b+o, "%s%s", browL, browR);
+    o += sprintf(b+o, "<ellipse cx='37' cy='%.1f' rx='7.5' ry='%.1f' fill='#ffffff'/>", ey, eyry);
+    o += sprintf(b+o, "<ellipse cx='63' cy='%.1f' rx='7.5' ry='%.1f' fill='#ffffff'/>", ey, eyry);
+    o += sprintf(b+o, "<circle cx='38' cy='%.1f' r='3.7' fill='#241c18'/>", ey+pdy);
+    o += sprintf(b+o, "<circle cx='62' cy='%.1f' r='3.7' fill='#241c18'/>", ey+pdy);
+    o += sprintf(b+o, "<circle cx='39.3' cy='%.1f' r='1.3' fill='#ffffff'/>", ey+pdy-1.6f);
+    o += sprintf(b+o, "<circle cx='63.3' cy='%.1f' r='1.3' fill='#ffffff'/>", ey+pdy-1.6f);
+    o += sprintf(b+o, "<path d='M50,58 L46.5,67 L53.5,67' fill='none' stroke='#00000022' stroke-width='2'/>");
+    o += sprintf(b+o, "%s</svg>", mouth);
 }
 static void LoadArt(void)
 {
@@ -169,7 +224,39 @@ static void LoadArt(void)
     gBallModel = LoadModelFromMesh(GenMeshSphere(BALL_R*3.0f, 22, 22));
     gBallModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = gBallTex;
     gBallRot   = QuaternionIdentity();
-    for (int i = 0; i < FACE_SKINS; i++) { BuildFaceSvg(buf, gHairTone[i]); gFaceTex[i] = SvgTexture(buf, 160, 160); }
+
+    gHeadModel = LoadModelFromMesh(GenMeshSphere(0.30f, 20, 24));
+    for (int i = 0; i < FACE_SKINS; i++) {
+        Image im = BuildHeadImage(gSkinTone[i], gHairTone[i]);
+        gHeadTex[i] = LoadTextureFromImage(im); SetTextureFilter(gHeadTex[i], TEXTURE_FILTER_BILINEAR);
+        UnloadImage(im);
+    }
+    for (int e = 0; e < EXPR_COUNT; e++) { BuildExprSvg(buf, e); gExprTex[e] = SvgTexture(buf, 176, 176); }
+}
+// Draw a texture as a flat quad centered at `c`, facing `nrm`, with `up` as its
+// vertical — used for the face decal so it turns to look wherever the ball is.
+static void DrawDecal(Texture2D tex, Vector3 c, Vector3 nrm, Vector3 up, float w, float h)
+{
+    Vector3 right = Vector3CrossProduct(up, nrm);
+    if (Vector3Length(right) < 1e-4f) return;
+    right = Vector3Normalize(right);
+    Vector3 vu = Vector3Normalize(Vector3CrossProduct(nrm, right));
+    Vector3 hx = Vector3Scale(right, w*0.5f), hy = Vector3Scale(vu, h*0.5f);
+    Vector3 tl = Vector3Add(Vector3Add(c, Vector3Negate(hx)), hy);
+    Vector3 tr = Vector3Add(Vector3Add(c, hx), hy);
+    Vector3 br = Vector3Subtract(Vector3Add(c, hx), hy);
+    Vector3 bl = Vector3Subtract(Vector3Add(c, Vector3Negate(hx)), hy);
+    rlDisableBackfaceCulling();
+    rlSetTexture(tex.id);
+    rlBegin(RL_QUADS);
+        rlColor4ub(255,255,255,255);
+        rlTexCoord2f(0,0); rlVertex3f(tl.x, tl.y, tl.z);
+        rlTexCoord2f(0,1); rlVertex3f(bl.x, bl.y, bl.z);
+        rlTexCoord2f(1,1); rlVertex3f(br.x, br.y, br.z);
+        rlTexCoord2f(1,0); rlVertex3f(tr.x, tr.y, tr.z);
+    rlEnd();
+    rlSetTexture(0);
+    rlEnableBackfaceCulling();
 }
 // Roll the ball skin: rolling contact tumbles it, sidespin adds visible curl.
 static void SpinBall(float dt)
@@ -442,7 +529,7 @@ static void StartKick(void)
     ResetKeeper(); InitNet();
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
     g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
-    g.cine = false; g.closest = 1e9f; gBallRot = QuaternionIdentity();
+    g.cine = false; g.cineArmed = false; g.closest = 1e9f; gBallRot = QuaternionIdentity();
 }
 static void SetupRound(int r)
 {
@@ -484,6 +571,24 @@ static void CommitKeeperDive(void)
     g.kprDiveX = Clamp(px * 0.8f + err, -GOAL_HALF_W - 0.6f, GOAL_HALF_W + 0.6f);
     g.kprDiveH = Clamp(py * 0.85f + 0.35f, 0.5f, GOAL_H);
     g.kprReact = 0.16f + Frand() * 0.12f; g.kprLaunched = false; g.kprVel = (Vector3){0};
+
+    // Arm a bullet-time replay from what we can already predict: how near the
+    // keeper's dive lands to the ball's line, and whether it rattles the post.
+    // Deciding here (not at resolution) lets the slow-mo catch the *lead-up*.
+    float gap     = sqrtf((px-g.kprDiveX)*(px-g.kprDiveX) + (py-g.kprDiveH)*(py-g.kprDiveH));
+    float postGap = fabsf(fabsf(px) - GOAL_HALF_W);
+    bool inFrame  = fabsf(px) < GOAL_HALF_W + 0.5f && py < GOAL_H + 0.4f;
+    float pc = 0.05f;
+    if      (inFrame && gap < 0.40f) pc = 0.80f;         // fingertip drama
+    else if (inFrame && gap < 0.75f) pc = 0.42f;
+    else if (inFrame && gap < 1.15f) pc = 0.18f;
+    if (postGap < 0.28f)             pc = fmaxf(pc, 0.72f);   // off the woodwork
+    g.cineArmed = inFrame && (Frand() < pc);
+    if (g.cineArmed) {                                   // pre-frame the point of contact
+        g.cineFocus = (Vector3){ (px + g.kprDiveX)*0.5f, Clamp((py + g.kprDiveH)*0.5f, 0.6f, 2.0f), GOAL_Z - 0.35f };
+        g.cineAng0  = (px >= 0.0f) ? -0.45f : 0.45f;
+        g.cineDir   = (px >= 0.0f) ?  1.0f : -1.0f;
+    }
 }
 static void Resolve(Result r)
 {
@@ -498,21 +603,10 @@ static void Resolve(Result r)
     if (!g.kprLaunched || (g.kprPos.y > 0.85f && fabsf(g.kprVel.y) < 2.0f)) {
         g.landed = true;  g.reactOnGround = false; g.reactBase = (Vector3){ g.kprPos.x, 1.05f, g.kprPos.z }; g.reactAxis = (Vector3){0,1,0};
     } else { g.landed = false; g.reactOnGround = true; }
-
-    // bullet-time replay: ~1 in 5 plays overall, heavily biased to close calls & saves
-    float pc = 0.08f;
-    if (r == RES_SAVE) pc = 0.55f;
-    else if (r == RES_POST) pc = 0.72f;
-    if (g.closest < 0.45f)      pc += 0.35f;   // a whisker from the gloves
-    else if (g.closest < 0.95f) pc += 0.15f;
-    if (Frand() < pc) {
-        g.cine = true; g.cineT = 0.0f; g.cineDur = 2.4f;
-        Vector3 mid = Vector3Lerp(g.ball.pos, g.kprPos, 0.5f);
-        mid.y = Clamp(mid.y, 0.7f, 1.8f);
-        g.cineFocus = mid;
-        g.cineAng0 = (g.ball.pos.x >= 0.0f) ? -0.5f : 0.5f;   // open from the action's side
-        g.cineDir  = (g.ball.pos.x >= 0.0f) ?  1.0f : -1.0f;
-    }
+    // NOTE: the replay is armed in CommitKeeperDive and engaged pre-contact, so
+    // the slow-mo captures the approach and the moment of impact. Once contact
+    // lands, wind the replay down quickly so it lingers on the moment, not after.
+    if (g.cine) g.cineDur = fminf(g.cineDur, g.cineT + 0.95f);
 }
 
 // turf: bounce if descending fast, else roll — and KILL spin so it can't spiral
@@ -790,18 +884,34 @@ static void DrawKeeper(void)
         kit  = (Color){ (unsigned char)(kit.r*0.7f),  (unsigned char)(kit.g*0.7f),  (unsigned char)(kit.b*0.7f),  255 };
         sock = (Color){ (unsigned char)(sock.r*0.7f), (unsigned char)(sock.g*0.7f), (unsigned char)(sock.b*0.7f), 255 };
     }
-    Color skin = gSkinTone[gFaceSel];
     Color boot = (Color){ 28, 28, 34, 255 };
 
-    // legs: hip -> knee (thigh, kit shorts) -> foot (shin, sock) -> boot; they
-    // trail along -up, so an upright keeper stands and a diving one splays out.
-    Vector3 hipL = Vector3Add(hip, Vector3Scale(side, -0.15f));
-    Vector3 hipR = Vector3Add(hip, Vector3Scale(side,  0.15f));
+    // ---- leg animation params by stance (nothing is ever fully static) ----
+    float t = GetTime();
+    bool  standing = up.y > 0.82f;
+    float crouch = 0.0f, spread = 0.15f, kneeF = 0.10f, bounce = 0.0f, kick = 0.0f;
+    if (g.phase == PHASE_CHARGE || (g.phase == PHASE_AIM)) {      // set, ready to spring
+        float c = (g.phase == PHASE_CHARGE) ? g.power01 : 0.15f;
+        crouch = 0.05f + c*0.13f; spread = 0.17f + c*0.03f; kneeF = 0.14f + c*0.06f;
+        bounce = sinf(t*2.4f)*0.012f;
+    } else if (!standing) {                                       // airborne / diving: scissor the legs
+        kick = 0.16f; spread = 0.19f;
+    } else {                                                      // idle breathing sway
+        bounce = sinf(t*2.0f)*0.015f; crouch = 0.02f;
+        if (g.resolved && g.reactCelebrate) kick = 0.10f + fabsf(sinf(t*7.0f))*0.06f;   // happy jig
+    }
+    Vector3 hipBase = Vector3Add(hip, Vector3Scale(up, -crouch + bounce));
+
+    // legs: hip -> knee (thigh, kit shorts) -> foot (shin, sock) -> boot
     for (int s = -1; s <= 1; s += 2) {
-        Vector3 hp  = (s < 0) ? hipL : hipR;
-        Vector3 kn  = Vector3Add(Vector3Add(hp, Vector3Scale(up, -0.28f)),
-                                 Vector3Add(Vector3Scale(fwd, 0.10f), Vector3Scale(side, s*0.02f)));
-        Vector3 ft  = Vector3Add(Vector3Add(kn, Vector3Scale(up, -0.26f)), Vector3Scale(fwd, 0.06f));
+        float ph = (s < 0) ? 0.0f : PI;                          // opposite phase per leg
+        float kb = kneeF + kick*0.5f*sinf(t*9.0f + ph);          // knee drive
+        float lift = kick * fmaxf(0.0f, sinf(t*9.0f + ph)) * 0.14f;
+        Vector3 hp  = Vector3Add(hipBase, Vector3Scale(side, s*spread));
+        Vector3 kn  = Vector3Add(Vector3Add(hp, Vector3Scale(up, -0.28f + lift)),
+                                 Vector3Add(Vector3Scale(fwd, kb), Vector3Scale(side, s*0.02f)));
+        Vector3 ft  = Vector3Add(Vector3Add(kn, Vector3Scale(up, -0.26f + lift*0.5f)),
+                                 Vector3Scale(fwd, 0.06f + kick*0.5f*sinf(t*9.0f + ph)));
         Vector3 toe = Vector3Add(Vector3Add(ft, Vector3Scale(fwd, 0.15f)), Vector3Scale(up, -0.03f));
         DrawCylinderEx(hp, kn, 0.12f, 0.10f, 10, kit);           // thigh (shorts)
         DrawSphere(kn, 0.10f, sock);                             // knee
@@ -818,14 +928,27 @@ static void DrawKeeper(void)
     DrawSphere(g.kprGL, GLOVE_R, gHome.b);                       // gloves (hands)
     DrawSphere(g.kprGR, GLOVE_R, gHome.b);
 
-    DrawSphere(headPos, 0.30f, skin);                            // big Mii-style head
-    // face: a billboard sitting just proud of the head surface (radius 0.30),
-    // so it is never swallowed by the sphere; tilts with the keeper's up axis
-    Vector3 toCam = Vector3Normalize(Vector3Subtract(g.cam.position, headPos));
-    Vector3 facePos = Vector3Add(headPos, Vector3Scale(toCam, 0.32f));
-    DrawBillboardPro(g.cam, gFaceTex[gFaceSel],
-                     (Rectangle){0, 0, (float)gFaceTex[gFaceSel].width, (float)gFaceTex[gFaceSel].height},
-                     facePos, up, (Vector2){0.60f, 0.60f}, (Vector2){0.30f, 0.30f}, 0.0f, WHITE);
+    // ---- head: shaded skin sphere, pole aimed along "up" ----
+    gHeadModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = gHeadTex[gFaceSel];
+    gHeadModel.transform = QuaternionToMatrix(QuaternionFromVector3ToVector3((Vector3){0,1,0}, up));
+    DrawModel(gHeadModel, headPos, 1.0f, WHITE);
+
+    // ---- face: an expression decal that turns to watch the ball ----
+    int expr = EXPR_FOCUS;
+    if (g.resolved)            expr = g.reactCelebrate ? EXPR_HAPPY : EXPR_ANGRY;
+    else if (Vector3Length(Vector3Subtract(g.ball.pos, headPos)) < 1.7f) expr = EXPR_WORRY;
+    // gaze: toward the ball in play, otherwise forward; clamp to a 75° front cone
+    Vector3 look = (!g.resolved) ? Vector3Subtract(g.ball.pos, headPos) : fwd;
+    if (Vector3Length(look) < 1e-3f) look = fwd;
+    look = Vector3Normalize(look);
+    float d = Vector3DotProduct(look, fwd), cmin = cosf(75.0f*DEG2RAD);
+    if (d < cmin) {
+        Vector3 perp = Vector3Subtract(look, Vector3Scale(fwd, d));
+        look = (Vector3Length(perp) < 1e-3f) ? fwd
+             : Vector3Normalize(Vector3Add(Vector3Scale(fwd, cmin), Vector3Scale(Vector3Normalize(perp), sinf(75.0f*DEG2RAD))));
+    }
+    Vector3 facePos = Vector3Add(headPos, Vector3Scale(look, 0.285f));
+    DrawDecal(gExprTex[expr], facePos, look, up, 0.46f, 0.46f);
 }
 
 // ---- replay camera ------------------------------------------------------
@@ -836,13 +959,13 @@ static void DriveCamera(float dt)
     Vector3 wantP = CAM_POS, wantT = CAM_TGT;
     if (g.cine) {
         float u  = Clamp(g.cineT / g.cineDur, 0.0f, 1.0f);
-        float R  = Lerp(4.4f, 2.7f, u);                       // dolly in as it sweeps
-        float th = g.cineAng0 + g.cineDir * u * 3.1f;         // ~175° arc around the action
+        float R  = Lerp(3.3f, 2.1f, u);                       // tight, slowly dollying closeup
+        float th = g.cineAng0 + g.cineDir * u * 2.4f;         // ~140° arc, lingering on contact
         Vector3 f = g.cineFocus;
-        wantT = f;
-        wantP = (Vector3){ f.x + sinf(th)*R, f.y + 1.05f + sinf(u*PI)*0.55f, f.z - cosf(th)*R };
+        wantT = Vector3Lerp(f, g.ball.pos, 0.35f);            // bias framing onto the ball
+        wantP = (Vector3){ f.x + sinf(th)*R, f.y + 0.75f + sinf(u*PI)*0.4f, f.z - cosf(th)*R };
     }
-    float k = Clamp((g.cine ? 9.0f : 4.5f) * dt, 0.0f, 1.0f);
+    float k = Clamp((g.cine ? 10.0f : 4.5f) * dt, 0.0f, 1.0f);
     g.cam.position = Vector3Lerp(g.cam.position, wantP, k);
     g.cam.target   = Vector3Lerp(g.cam.target,   wantT, k);
 }
@@ -854,8 +977,13 @@ static void UpdateDrawFrame(void)
     if (dt > 0.05f) dt = 0.05f;
     if (g.celebrate > 0.0f) g.celebrate -= dt;
     if (g.scrambleCd > 0.0f) g.scrambleCd -= dt;
+    // engage the armed replay as the ball enters its final approach, so the
+    // slow-mo runs through the lead-up and the moment of contact (not just after)
+    if (g.phase == PHASE_FLY && !g.resolved && g.cineArmed && !g.cine && g.ball.pos.z > GOAL_Z - 3.0f) {
+        g.cine = true; g.cineArmed = false; g.cineT = 0.0f; g.cineDur = 3.6f;
+    }
     if (g.cine) { g.cineT += dt; if (g.cineT >= g.cineDur) g.cine = false; }
-    float sdt = g.cine ? dt * 0.25f : dt;                     // bullet-time slows the sim
+    float sdt = g.cine ? dt * 0.13f : dt;                     // bullet-time slows the sim hard
     Vector2 m = GetMousePosition();
 
     switch (g.phase) {
@@ -892,15 +1020,15 @@ static void UpdateDrawFrame(void)
     case PHASE_FLY: {
         StepNet(sdt);
         if (!g.resolved) {
-            StepKeeper(dt);
+            StepKeeper(sdt);
             TryScramble();                     // late lunge for a loose/slow ball
             { float sp = Vector3Length(g.kprVel);
               Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
-              UpdateGloves(dt, tA, GlovePos(-1), GlovePos(+1)); }
-            StepBallLive(dt);
-            SpinBall(dt);
+              UpdateGloves(sdt, tA, GlovePos(-1), GlovePos(+1)); }
+            StepBallLive(sdt);
+            SpinBall(sdt);
             g.flight += dt;
-            if (!g.resolved && g.flight > 5.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
+            if (!g.cine && g.flight > 5.0f) Resolve(g.hitWood ? RES_POST : RES_MISS);
         } else {
             KeeperReact(sdt); StepBallSettle(sdt); SpinBall(sdt); g.resultTimer += sdt;
             if (!g.cine && g.landed && g.reactT > REACT_DUR) {
