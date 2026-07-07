@@ -75,6 +75,9 @@ typedef struct {
     // touch input
     bool    touchCharge;
     float   pressX;
+    // kicker's-eye camera
+    int     camStyle;                // which run-up/framing rig this kick uses
+    float   kickT;                   // run-up clock (advances while charging)
     // bullet-time replay
     bool    cine, cineArmed;
     float   cineT, cineDur, cineAng0, cineDir, closest;
@@ -141,6 +144,7 @@ static const Sponsor SPONSORS[NSPON] = {
     { "ROWCLEAR",   "falling blocks",          { 62, 42,112,255}, {245,240,255,255}, {170,122,240,255} },
 };
 static Texture2D gBannerTex[NSPON];
+static int       gBannerOrder[NSPON];   // shuffled per stage so all sponsors get airtime
 
 static float Frand(void)  { return GetRandomValue(0, 1000) / 1000.0f; }
 static float Frand2(void) { return (Frand() - 0.5f) * 2.0f; }
@@ -538,6 +542,16 @@ static void UpdateGloves(float dt, Vector3 tAxis, Vector3 tGL, Vector3 tGR)   //
 // trailing follow — so the keeper's arms read as an extension of his attention.
 static void ReachForBall(float dt, Vector3 tAxis)
 { UpdateGlovesK(dt, tAxis, GlovePos(-1), GlovePos(+1), 320.0f, 26.0f); }
+// A goalkeeper's set stance held until he actually commits — hands up, forward
+// and shoulder-width, with a small ready-bob. Keeps the arms from lunging at the
+// ball a beat before the body scampers after it.
+static void ReadyGloves(float dt)
+{
+    float b = sinf(GetTime()*3.0f) * 0.02f;
+    Vector3 gl = Vector3Add(g.kprPos, (Vector3){ -0.34f, 0.28f + b, 0.42f });
+    Vector3 gr = Vector3Add(g.kprPos, (Vector3){  0.34f, 0.28f - b, 0.42f });
+    UpdateGloves(dt, (Vector3){0,1,0}, gl, gr);
+}
 
 // ---- keeper reactions ---------------------------------------------------
 static void ComputeReactionPose(float t, float dt)
@@ -644,12 +658,15 @@ static void StartKick(void)
     g.result = RES_NONE; g.resolved = false; g.caught = false; g.hitWood = false;
     g.resultTimer = 0.0f; g.flight = 0.0f; g.landed = false; g.reactT = 0.0f; g.touchCharge = false;
     g.cine = false; g.cineArmed = false; g.closest = 1e9f; gBallRot = QuaternionIdentity();
+    g.kickT = 0.0f; g.camStyle = GetRandomValue(0, 2);   // fresh run-up + framing per kick
 }
 static void SetupRound(int r)
 {
     Moment m = gRounds[r];
     gEra = m.era; gHome = TEAMS[m.home]; gAway = TEAMS[m.away];
     gFaceSel = (m.home + r*2 + 1) % FACE_SKINS;          // keeper's look varies by round
+    for (int i = 0; i < NSPON; i++) gBannerOrder[i] = i; // reshuffle the hoardings each stage
+    for (int i = NSPON-1; i > 0; i--) { int j = GetRandomValue(0, i); int s = gBannerOrder[i]; gBannerOrder[i] = gBannerOrder[j]; gBannerOrder[j] = s; }
     g.target = m.oppGoals;                               // beat the opponent's tally
     for (int i = 0; i < KICKS_TOTAL; i++) g.kickRes[i] = RES_NONE;
     g.kick = 0; g.scored = 0;
@@ -937,14 +954,14 @@ static void DrawBanners(void)
     float bh = 0.9f, y = 0.72f, z = GOAL_Z + 2.15f, gap = 0.22f;
     float w[NSPON], total = 0.0f;                        // each board as wide as its (variable) texture
     for (int i = 0; i < n; i++) {
-        Texture2D t = gBannerTex[(i + g.round) % NSPON];
+        Texture2D t = gBannerTex[gBannerOrder[i]];
         w[i] = bh * ((float)t.width / (float)t.height);
         total += w[i] + (i ? gap : 0.0f);
     }
     DrawCube((Vector3){0, y, z + 0.06f}, total + 0.5f, bh + 0.12f, 0.1f, (Color){18,20,26,255});   // backing rail
     float x = -total/2.0f;
     for (int i = 0; i < n; i++) {
-        Texture2D t = gBannerTex[(i + g.round) % NSPON];
+        Texture2D t = gBannerTex[gBannerOrder[i]];
         DrawDecal(t, (Vector3){x + w[i]/2.0f, y, z}, (Vector3){0,0,-1}, (Vector3){0,1,0}, w[i], bh);
         x += w[i] + gap;
     }
@@ -1128,9 +1145,17 @@ static void DrawKeeper(void)
 // ---- replay camera ------------------------------------------------------
 // Eases the camera between its fixed match view and an orbiting closeup that
 // spins around the save/goal during a bullet-time replay.
+// Kicker's-eye rigs: a spot you stand off from, a spot you plant at as you run
+// up, and how much the framing leans toward the goal (0 = glued to the ball,
+// higher = pull back to keep the keeper in shot).
+static const struct { Vector3 back, plant; float mix; } CAM_RIG[3] = {
+    {{ 0.0f, 2.9f, -7.6f}, { 0.0f, 2.15f, -5.5f}, 0.20f},   // 0: tight ball-cam
+    {{ 0.0f, 3.4f, -8.5f}, { 0.15f, 2.7f, -6.4f}, 0.48f},   // 1: wide — ball + keeper
+    {{-1.4f, 2.9f, -7.5f}, {-1.0f, 2.3f, -5.7f}, 0.32f},    // 2: over-the-shoulder
+};
 static void DriveCamera(float dt)
 {
-    Vector3 wantP = CAM_POS, wantT = CAM_TGT;
+    Vector3 wantP, wantT;
     if (g.cine) {
         float u  = Clamp(g.cineT / g.cineDur, 0.0f, 1.0f);
         float R  = Lerp(3.3f, 2.1f, u);                       // tight, slowly dollying closeup
@@ -1138,8 +1163,27 @@ static void DriveCamera(float dt)
         Vector3 f = g.cineFocus;
         wantT = Vector3Lerp(f, g.ball.pos, 0.35f);            // bias framing onto the ball
         wantP = (Vector3){ f.x + sinf(th)*R, f.y + 0.75f + sinf(u*PI)*0.4f, f.z - cosf(th)*R };
+    } else if (g.phase == PHASE_RESULT || (g.phase == PHASE_FLY && g.resolved)) {
+        wantP = CAM_POS; wantT = CAM_TGT;                     // settle for the aftermath + board (no ball-chasing)
+    } else {
+        Vector3 back = CAM_RIG[g.camStyle].back, plant = CAM_RIG[g.camStyle].plant;
+        float   mix  = CAM_RIG[g.camStyle].mix;
+        Vector3 goalPt = { 0.0f, 1.25f, GOAL_Z };
+        wantT = Vector3Lerp(g.ball.pos, goalPt, mix);         // frame the ball, leaning to the goal
+        if (g.phase == PHASE_CHARGE) {
+            float ru = Clamp(g.kickT / 0.7f, 0.0f, 1.0f); ru = ru*ru*(3.0f - 2.0f*ru);   // run-up ease
+            Vector3 base = Vector3Lerp(back, plant, ru);
+            float bob  = sinf(g.kickT*14.0f) * 0.06f * sinf(ru*PI);   // footfalls, fading as he plants
+            float sway = sinf(g.kickT* 7.0f) * 0.04f * sinf(ru*PI);
+            wantP = Vector3Add(base, (Vector3){ sway, bob, 0.0f });
+        } else if (g.phase == PHASE_FLY) {
+            wantP = plant;                                    // planted; the target pans after the shot
+            wantT = Vector3Lerp(g.ball.pos, goalPt, mix*0.7f);
+        } else {                                              // PHASE_AIM: stand off and size it up
+            wantP = back;
+        }
     }
-    float k = Clamp((g.cine ? 10.0f : 4.5f) * dt, 0.0f, 1.0f);
+    float k = Clamp((g.cine ? 10.0f : (g.phase == PHASE_FLY ? 7.0f : 4.5f)) * dt, 0.0f, 1.0f);
     g.cam.position = Vector3Lerp(g.cam.position, wantP, k);
     g.cam.target   = Vector3Lerp(g.cam.target,   wantT, k);
 }
@@ -1179,6 +1223,7 @@ static void UpdateDrawFrame(void)
     } break;
 
     case PHASE_CHARGE: {
+        g.kickT += dt;                                         // run-up clock for the kicker's-eye camera
         g.power01 += g.chargeDir * 1.6f * dt;                   // hold charges & uncharges
         if (g.power01 >= 1.0f) { g.power01 = 1.0f; g.chargeDir = -1.0f; }
         if (g.power01 <= 0.0f) { g.power01 = 0.0f; g.chargeDir =  1.0f; }
@@ -1196,9 +1241,13 @@ static void UpdateDrawFrame(void)
         if (!g.resolved) {
             StepKeeper(sdt);
             TryScramble();                     // late lunge for a loose/slow ball
-            { float sp = Vector3Length(g.kprVel);
-              Vector3 tA = (g.kprLaunched && sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
-              ReachForBall(sdt, tA); }         // hands lead toward the ball
+            if (g.kprLaunched) {               // reach only once he scampers — arms + body together
+                float sp = Vector3Length(g.kprVel);
+                Vector3 tA = (sp > 1.0f) ? Vector3Scale(g.kprVel, 1.0f/sp) : (Vector3){0,1,0};
+                ReachForBall(sdt, tA);
+            } else {
+                ReadyGloves(sdt);              // set stance during the read — no early arm-tug
+            }
             StepBallLive(sdt);
             SpinBall(sdt);
             g.flight += dt;
