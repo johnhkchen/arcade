@@ -1,0 +1,60 @@
+name: build-and-deploy
+
+# The same loop the arcade is built by, automated: compile each raylib cartridge
+# to WASM, gate on the headless smoke test (every cartridge must boot with a live
+# WebGL canvas and zero errors), and only then deploy to arcade.b28.dev.
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'web/**', 'build.sh', 'wrangler.jsonc', 'test/**', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-arcade          # never let two deploys race (the lesson learned the hard way)
+  cancel-in-progress: false
+
+jobs:
+  build-gate-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.2
+          actions-cache-folder: emsdk-cache
+
+      - name: Clone raylib (headers + web build target)
+        run: git clone --depth 1 https://github.com/raysan5/raylib.git raylib
+
+      - name: Cache raylib web static lib
+        uses: actions/cache@v4
+        with:
+          path: raylib/src/libraylib.web.a
+          key: raylib-web-v1
+
+      - name: Build cartridges
+        env:
+          RAYLIB_SRC: ${{ github.workspace }}/raylib/src
+        run: |
+          ./build.sh penalty          # build.sh compiles raylib's web lib on a cache miss, else reuses it
+          cp web/hub.html dist/index.html
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Smoke gate (headless WebGL boot test)
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          npm test
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy

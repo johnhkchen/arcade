@@ -6,8 +6,9 @@ GAME="${1:-penalty}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 RAYLIB_SRC="${RAYLIB_SRC:-$HOME/raylib/src}"
 
+# Load the local emsdk if present; CI (setup-emsdk action) already has emcc on PATH.
 # shellcheck disable=SC1090
-source "$HOME/emsdk/emsdk_env.sh"
+[ -f "$HOME/emsdk/emsdk_env.sh" ] && source "$HOME/emsdk/emsdk_env.sh" || true
 
 # Build raylib's web static lib once.
 if [ ! -f "$RAYLIB_SRC/libraylib.web.a" ] && [ ! -f "$RAYLIB_SRC/libraylib.a" ]; then
