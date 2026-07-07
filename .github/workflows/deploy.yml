@@ -44,7 +44,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22          # wrangler 4.x requires Node >= 22
 
       - name: Smoke gate (headless WebGL boot test)
         run: |
